@@ -101,6 +101,8 @@ class Collection:
                         updated[key] = deepcopy(value)
                     for key, value in changes.get("$inc", {}).items():
                         updated[key] += value
+                    for key in changes.get("$unset", {}):
+                        updated.pop(key, None)
                     self.check_indexes(updated, exclude=doc["_id"])
                     self.docs[doc["_id"]] = updated
                     return SimpleNamespace(modified_count=1)
@@ -149,12 +151,13 @@ class PaperStateTests(unittest.TestCase):
     def test_competing_entries_and_restart_preserve_one_position(self):
         position = self.open()
         self.assertEqual(position["entry_price"], 99000)
+        self.assertNotIn("id", position)
         with self.assertRaises(RuntimeError):
             self.open()
         recovered = paper_state.create_state(self.trades)
         self.assertEqual(recovered["position"], position)
         self.assertTrue(recovered["morning_used"])
-        self.assertEqual(self.trades.find_one({"_id": position["id"]}), position)
+        self.assertEqual(self.trades.find_one({"_id": position["_id"]}), position)
 
     def test_close_updates_same_trade_without_archive_or_singleton(self):
         position = self.open()
@@ -163,9 +166,32 @@ class PaperStateTests(unittest.TestCase):
         self.assertEqual(trade["pnl"], -2000)
         self.assertAlmostEqual(trade["net_pnl"], trade["pnl"] - trade["charges"]["total"], places=2)
         self.assertIsNone(paper_state.create_state(self.trades)["position"])
-        self.assertEqual(self.trades.find_one({"_id": position["id"]}), trade)
+        self.assertEqual(self.trades.find_one({"_id": position["_id"]}), trade)
         self.assertEqual(len(self.trades.docs), 1)
         paper_state.initialize_store(self.trades)
+
+    def test_existing_trade_with_duplicate_id_recovers_and_closes(self):
+        position = self.open()
+        self.trades.docs[position["_id"]]["id"] = position["_id"]
+        paper_state.initialize_store(self.trades)
+        self.assertEqual(paper_state.create_state(self.trades)["position"]["id"], position["_id"])
+        trade = self.close()
+        self.assertNotIn("id", trade)
+        self.assertEqual(self.trades.find_one({"_id": position["_id"]}), trade)
+        paper_state.initialize_store(self.trades)
+
+    def test_startup_rejects_mismatched_duplicate_id(self):
+        position = self.open()
+        self.trades.docs[position["_id"]]["id"] = "different"
+        with self.assertRaises(RuntimeError):
+            paper_state.initialize_store(self.trades)
+
+    def test_startup_removes_duplicate_id_from_closed_trade(self):
+        position = self.open()
+        trade = self.close()
+        self.trades.docs[position["_id"]]["id"] = position["_id"]
+        paper_state.initialize_store(self.trades)
+        self.assertEqual(self.trades.find_one({"_id": position["_id"]}), trade)
 
     def test_session_id_survives_close_and_blocks_stale_entry(self):
         self.open()
@@ -321,8 +347,7 @@ class PaperStateTests(unittest.TestCase):
         position = self.open()
         del self.trades.indexes["silver_one_active_trade"]
         del self.trades.indexes["silver_occupied_minutes"]
-        other = dict(position, _id="silver:2026-11-13:evening",
-                     id="silver:2026-11-13:evening", session="evening")
+        other = dict(position, _id="silver:2026-11-13:evening", session="evening")
         self.trades.insert_one(other)
         with self.assertRaises((RuntimeError, DuplicateKeyError)):
             paper_state.initialize_store(self.trades)

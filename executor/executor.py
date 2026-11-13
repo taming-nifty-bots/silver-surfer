@@ -70,14 +70,14 @@ def initialize_store(trades):
     for trade in trades.find({}):
         if (trade.get("strategy_state") not in ("active", "closed")
                 or not all(key in trade for key in
-                           ("id", "session", "entry_timestamp", "entry_price", "quantity",
+                           ("_id", "session", "entry_timestamp", "entry_price", "quantity",
                             "version", "occupied_minutes"))
-                or trade["_id"] != trade["id"]
+                or ("id" in trade and trade["_id"] != trade["id"])
                 or trade["session"] not in ("morning", "evening")):
             raise RuntimeError("Legacy or invalid paper data; reconcile and migrate before startup")
         minutes = [str(valid_time(trade["entry_timestamp"]).floor("min"))]
         day = str(valid_time(trade["entry_timestamp"]).date())
-        if trade["id"] != f"silver:{day}:{trade['session']}":
+        if trade["_id"] != f"silver:{day}:{trade['session']}":
             raise RuntimeError("Invalid paper trade ID; reconcile before startup")
         if trade["strategy_state"] == "closed":
             if valid_time(trade["exit_timestamp"]) < valid_time(trade["entry_timestamp"]):
@@ -85,6 +85,12 @@ def initialize_store(trades):
             minutes.append(str(valid_time(trade["exit_timestamp"]).floor("min")))
         if trade["occupied_minutes"] != minutes:
             raise RuntimeError("Invalid paper trade minutes; reconcile before startup")
+        if trade["strategy_state"] == "closed" and "id" in trade:
+            result = trades.update_one({"_id": trade["_id"], "id": trade["_id"],
+                                        "version": trade["version"], "strategy_state": "closed"},
+                                       {"$unset": {"id": ""}})
+            if result.modified_count != 1:
+                raise RuntimeError("Could not remove duplicate ID from closed paper trade")
     trades.create_index([("strategy_state", 1)], name="silver_one_active_trade",
                         unique=True, partialFilterExpression={"strategy_state": "active"})
     # A close atomically releases the active slot and reserves its exit minute.
@@ -174,7 +180,7 @@ def open_position(trades, state, signal, contract, quantity, quote, started_at, 
     if state["last_exit_minute"] == str(received.floor("min")):
         raise ValueError("A position closed during this minute")
     fill = priced_quote(quote, signal["side"], quantity, started_at, received_at)
-    position = dict(id=f"silver:{day}:{signal['session']}", session=signal["session"],
+    position = dict(_id=f"silver:{day}:{signal['session']}", session=signal["session"],
                     side=signal["side"], security_id=str(contract["security_id"]),
                     symbol=contract["symbol"], expiry=contract["expiry"],
                     quantity=quantity, entry_price=fill["price"],
@@ -182,7 +188,6 @@ def open_position(trades, state, signal, contract, quantity, quote, started_at, 
                     entry_signal_asof=str(asof), last_checked_asof=str(asof),
                     occupied_minutes=[str(received.floor("min"))],
                     profit_active=False, exit_requested=None, strategy_state="active", version=0)
-    position["_id"] = position["id"]
     try:
         trades.insert_one(position.copy())
     except DuplicateKeyError as error:
@@ -198,7 +203,7 @@ def update_activation(trades, state, active):
     if state["position"]["profit_active"] == active:
         return state
     position = state["position"]
-    result = trades.update_one({"_id": position["id"], "version": position["version"],
+    result = trades.update_one({"_id": position["_id"], "version": position["version"],
                                 "strategy_state": "active", "exit_requested": None},
                                {"$set": {"profit_active": active},
                                 "$inc": {"version": 1}})
@@ -216,7 +221,7 @@ def checkpoint_signal(trades, state, active, asof):
     current = valid_time(asof)
     if current < valid_time(position["last_checked_asof"]):
         raise ValueError("Cannot move the position checkpoint backwards")
-    result = trades.update_one({"_id": position["id"], "version": position["version"],
+    result = trades.update_one({"_id": position["_id"], "version": position["version"],
                                 "strategy_state": "active", "exit_requested": None},
                                {"$set": {"profit_active": active,
                                          "last_checked_asof": str(current)},
@@ -233,7 +238,7 @@ def request_exit(trades, state, reason, active):
         raise ValueError("A paper position, exit reason and boolean activation are required")
     if position["profit_active"] and not active:
         raise ValueError("Paper profit activation cannot be reset")
-    result = trades.update_one({"_id": position["id"], "version": position["version"],
+    result = trades.update_one({"_id": position["_id"], "version": position["version"],
                                 "strategy_state": "active", "exit_requested": None},
                                {"$set": {"profit_active": active,
                                          "exit_requested": reason},
@@ -267,11 +272,12 @@ def close_position(trades, state, reason, quote, started_at, received_at):
                  exit_timestamp=str(received), exit_quote=fill, exit_reason=reason,
                  occupied_minutes=position["occupied_minutes"] + [str(received.floor("min"))],
                  pnl=pnl, charges=charges, net_pnl=money(pnl - charges["total"]))
+    trade.pop("id", None)
     values = dict(trade)
     del values["_id"]
-    result = trades.update_one({"_id": position["id"], "version": position["version"],
+    result = trades.update_one({"_id": position["_id"], "version": position["version"],
                                 "strategy_state": "active", "exit_requested": reason},
-                               {"$set": values})
+                               {"$set": values, "$unset": {"id": ""}})
     if result.modified_count != 1:
         raise RuntimeError("Paper exit lost a concurrent state update; no fill recorded")
     return trade
@@ -323,7 +329,7 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
             quote, started, received = quote_source(position["security_id"])
             trade = close_position(trades, state, position["exit_requested"],
                                                quote, started, received)
-            alert(f"Exit {trade['id']} at {trade['exit_price']}; estimated net {trade['net_pnl']}")
+            alert(f"Exit {trade['_id']} at {trade['exit_price']}; estimated net {trade['net_pnl']}")
             if trade["exit_quote"]["insufficient_best_size"]:
                 alert("Best-level size was insufficient; full paper exit is optimistic")
             return
@@ -336,7 +342,7 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
             state = request_exit(trades, state, cutoff["reason"], position["profit_active"])
             quote, started, received = quote_source(position["security_id"])
             trade = close_position(trades, state, cutoff["reason"], quote, started, received)
-            alert(f"Forced exit {trade['id']} at {trade['exit_price']}; "
+            alert(f"Forced exit {trade['_id']} at {trade['exit_price']}; "
                   f"estimated net {trade['net_pnl']}")
             if trade["exit_quote"]["insufficient_best_size"]:
                 alert("Best-level size was insufficient; full paper exit is optimistic")
@@ -351,7 +357,7 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
         candles = candles_source(position)
         current = clock()
         if asof > checked + pd.Timedelta(minutes=1):
-            alert(f"Position {position['id']} missed signal checks after {checked}; "
+            alert(f"Position {position['_id']} missed signal checks after {checked}; "
                   "reconstructing observed candles; any missed exit uses a current quote.")
         expected = pd.date_range(max(checked + pd.Timedelta(minutes=1),
                                      pd.Timestamp(position["entry_timestamp"]).floor("min")),
@@ -359,7 +365,7 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
         observed = set(pd.to_datetime(candles["datetime"]))
         missing = [str(stamp) for stamp in expected if stamp not in observed]
         if missing:
-            alert(f"Position {position['id']} has {len(missing)} missing completed candles; "
+            alert(f"Position {position['_id']} has {len(missing)} missing completed candles; "
                   "activation and missed exits cannot be fully recovered.")
         if asof > checked + pd.Timedelta(minutes=1):
             result = strategy.recover_missed_exit(position, candles, asof)
@@ -378,7 +384,7 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
             state = request_exit(trades, state, result["reason"], result["profit_active"])
             quote, started, received = quote_source(position["security_id"])
             trade = close_position(trades, state, result["reason"], quote, started, received)
-            alert(f"Exit {trade['id']} at {trade['exit_price']}; estimated net {trade['net_pnl']}")
+            alert(f"Exit {trade['_id']} at {trade['exit_price']}; estimated net {trade['net_pnl']}")
             if trade["exit_quote"]["insufficient_best_size"]:
                 alert("Best-level size was insufficient; full paper exit is optimistic")
         else:
@@ -407,7 +413,7 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
     quote, started, received = quote_source(doc["security_id"])
     position = open_position(trades, state, doc, doc["contract"], quantity,
                                          quote, started, received)
-    alert(f"Entry {position['id']} {side} Qty {position['quantity']} at {position['entry_price']}; "
+    alert(f"Entry {position['_id']} {side} Qty {position['quantity']} at {position['entry_price']}; "
           f"spread {position['entry_quote']['spread']}")
     if position["entry_quote"]["insufficient_best_size"]:
         alert("Best-level size was insufficient; full paper fill is optimistic")
