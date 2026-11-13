@@ -2,7 +2,7 @@
 
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as clock_time, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -45,7 +45,22 @@ def checked_signal(signals, day, session, now):
     return doc
 
 
-def run_cycle(states, trades, signals, calendars, quote_source, candles_source, clock, alert):
+def session_finished(state, session, now):
+    if state is None or state["pending_trade"] is not None:
+        return False
+    position = state["position"]
+    if position is not None:
+        return (session == "morning" and position["session"] == "evening"
+                and now.date() == pd.Timestamp(position["entry_timestamp"]).date()
+                and now.time() >= clock_time(17))
+    if state["slot_day"] == str(now.date()) and state[session + "_used"]:
+        return True
+    cutoff = clock_time(16, 55) if session == "morning" else clock_time(23)
+    return now.time() >= cutoff and (session == "evening" or now.time() < clock_time(23))
+
+
+def run_cycle(states, trades, signals, calendars, quote_source, candles_source, clock, alert,
+              session=None, started_at=None):
     state = paper_state.create_state(states)
     if state["pending_trade"] is not None:
         paper_state.archive_trade(states, trades, state)
@@ -53,6 +68,13 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
     now = clock()
     position = state["position"]
     if position is not None:
+        if session is not None and position["session"] != session:
+            if (position["session"] == "morning" and session == "evening" and started_at is not None
+                    and now < max(started_at, now.replace(hour=17, minute=0, second=0, microsecond=0))
+                    + timedelta(minutes=1)):
+                return
+            if position["session"] == "evening" and session == "morning" and now.date() == pd.Timestamp(position["entry_timestamp"]).date():
+                return
         if position["exit_requested"] is not None:
             quote, started, received = quote_source(position["security_id"])
             trade = paper_state.close_position(states, state, position["exit_requested"],
@@ -63,7 +85,7 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
             return
         cutoff = decisions.exit_decision(position, None, now) if (
             now.date() > pd.Timestamp(position["entry_timestamp"]).date()
-            or now.time() >= (datetime.strptime("17:00", "%H:%M").time()
+            or now.time() >= (datetime.strptime("16:55", "%H:%M").time()
                               if position["session"] == "morning"
                               else datetime.strptime("23:00", "%H:%M").time())) else None
         if cutoff is not None:
@@ -104,7 +126,7 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
             result = decisions.exit_decision(dict(position, profit_active=active), doc, current)
         current = clock()
         if current.date() > pd.Timestamp(position["entry_timestamp"]).date() or (
-                position["session"] == "morning" and current.hour >= 17) or (
+                position["session"] == "morning" and current.time() >= clock_time(16, 55)) or (
                 position["session"] == "evening" and current.hour >= 23):
             result["reason"] = result["reason"] or "session cutoff"
         if result["reason"] is not None:
@@ -119,8 +141,12 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
         return
 
     status = market.session_status(calendars, now.date())
-    session = "morning" if now.hour < 17 else "evening"
+    session = session or ("morning" if now.hour < 17 else "evening")
     if not status[session] or not 9 <= now.hour < 23:
+        return
+    if session == "morning" and now.time() >= clock_time(16, 55):
+        return
+    if session == "evening" and now.time() < clock_time(17):
         return
     if state["slot_day"] == str(now.date()) and state[session + "_used"]:
         return
@@ -147,6 +173,9 @@ def main():
     mode = os.environ.get("live_trading", "false").strip().lower()
     if mode != "false":
         raise ValueError("Silver Surfer only supports paper execution; live orders are disabled")
+    session = os.environ.get("SILVER_SESSION", "").strip().lower()
+    if session not in ("morning", "evening"):
+        raise ValueError("SILVER_SESSION must be morning or evening")
     slack = WebClient(token=os.environ["slack_token"])
     client = MongoClient(os.environ["CONNECTION_STRING"])
     db = client["Bots"]
@@ -172,19 +201,31 @@ def main():
     def alert(message):
         notify(slack, message)
 
-    notify(slack, "Started in one-lot paper mode; live orders disabled")
+    notify(slack, f"Started {session} in one-lot paper mode; live orders disabled")
+    started_at = now_ist()
+    waiting_alert = False
     last_error = None
     last_alert = now_ist()
     try:
         while True:
             now = now_ist()
             try:
-                run_cycle(states, trades, signals, calendars, quote_source, candles_source, now_ist, alert)
+                state = states.find_one({"_id": paper_state.STATE_ID})
+                if (session == "evening" and now.time() >= clock_time(17) and state is not None
+                        and state["position"] is not None
+                        and state["position"]["session"] == "morning" and not waiting_alert):
+                    alert("Earlier morning position remains open; waiting one minute before recovery.")
+                    waiting_alert = True
+                run_cycle(states, trades, signals, calendars, quote_source, candles_source, now_ist, alert,
+                          session=session, started_at=started_at)
                 if last_error is not None:
                     alert("Executor recovered")
                     last_error = None
                 state = states.find_one({"_id": paper_state.STATE_ID})
-                if now.hour == 23 and now.minute >= 5 and state["position"] is None and state["pending_trade"] is None:
+                if session_finished(state, session, now_ist()):
+                    break
+                if (state["position"] is None and state["pending_trade"] is None
+                        and not market.session_status(calendars, now.date())[session]):
                     break
             except Exception as error:
                 message = utils.exception_detail(error)

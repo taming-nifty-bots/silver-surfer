@@ -37,6 +37,11 @@ class DecisionTests(unittest.TestCase):
         self.assertIsNone(decisions.entry_decision(doc, "2026-11-13 17:00", True))
         doc["session"] = "evening"
         self.assertEqual(decisions.entry_decision(doc, "2026-11-13 17:00", True), "BUY")
+        doc["session"] = "morning"
+        doc.update(data_asof="2026-11-13 16:53", brick_time="2026-11-13 16:53")
+        self.assertEqual(decisions.entry_decision(doc, "2026-11-13 16:54", True), "BUY")
+        doc.update(data_asof="2026-11-13 16:54", brick_time="2026-11-13 16:54")
+        self.assertIsNone(decisions.entry_decision(doc, "2026-11-13 16:55", True))
 
     def test_exit_activation_and_channel(self):
         result = decisions.exit_decision(trade(), signal(), "2026-11-13 10:01")
@@ -52,12 +57,12 @@ class DecisionTests(unittest.TestCase):
                          dict(reason="channel7", profit_active=True))
 
     def test_force_close_without_signal(self):
-        self.assertEqual(decisions.exit_decision(trade(), None, "2026-11-13 17:00")["reason"],
+        self.assertEqual(decisions.exit_decision(trade(), None, "2026-11-13 16:55")["reason"],
                          "session cutoff")
         self.assertEqual(decisions.exit_decision(trade(), None, "2026-11-14 08:00")["reason"],
                          "session cutoff")
         with self.assertRaises(ValueError):
-            decisions.exit_decision(trade(), None, "2026-11-13 16:59")
+            decisions.exit_decision(trade(), None, "2026-11-13 16:54")
 
     def test_contract_mismatch_and_old_signal(self):
         doc = deepcopy(signal())

@@ -45,7 +45,7 @@ def entry_decision(signal, now, session_open):
     if signal["side"] not in ("BUY", "SELL"):
         raise ValueError("Invalid signal side")
     if signal["session"] == "morning":
-        if not time(9) < now.time() < time(17):
+        if not time(9) < now.time() < time(16, 55):
             return None
     elif not time(17) <= now.time() < time(23):
         return None
@@ -59,7 +59,7 @@ def exit_decision(trade, signal, now):
         raise ValueError("Invalid position session")
     if now < entry:
         raise ValueError("Position entry is in the future")
-    cutoff = time(17) if trade["session"] == "morning" else time(23)
+    cutoff = time(16, 55) if trade["session"] == "morning" else time(23)
     if now.date() > entry.date() or now.time() >= cutoff:
         return dict(reason="session cutoff", profit_active=trade["profit_active"])
     if signal is None:

@@ -1,9 +1,14 @@
 # Silver Surfer
 
-Two Azure jobs were started for a one-lot paper forward test on 2026-11-13.
-They run on weekdays from 08:58 IST, subject to the MCX calendar. Signal
-publication and executor startup were verified; a completed paper trade,
-scheduled restart and real-world recovery remain unverified. Live execution
+The paper implementation uses separate morning and evening signal and executor
+jobs, with the same image and Mongo collections. Morning jobs start at 08:58 IST;
+evening jobs start at 16:58 IST, subject to the MCX calendar. Morning entries
+end at 16:55, when any open morning position is force-exited. After a session's
+trade is closed and archived, its jobs stop. If a morning position remains open
+at 17:00, the evening executor waits one minute and then retries its exit.
+Signal publication and executor startup were verified for the earlier
+single-day deployment; a completed paper trade, scheduled restart and
+real-world recovery remain unverified. Live execution
 is deliberately disabled; setting `live_trading` to anything other than
 `false` stops the executor.
 At each minute boundary, the executor allows up to 15 seconds for a fresh
@@ -38,6 +43,7 @@ python test_market.py
 python -m unittest test_executor test_publisher test_paper_state test_decisions test_paper test_signals
 python test_strategy.py
 python test_strategy.py --replay
+python test_strategy.py --compare-cutoff
 ```
 
 The optional replay reads the historical research data in the surrounding vault;

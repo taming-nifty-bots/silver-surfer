@@ -61,12 +61,68 @@ class ExecutorTests(unittest.TestCase):
         with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
             self.cycle()
         self.signals.docs.clear()
-        self.now = datetime(2026, 11, 13, 17, 0, 0)
+        self.now = datetime(2026, 11, 13, 16, 55, 0)
         with patch("executor.market.session_status", side_effect=RuntimeError("calendar unavailable")):
             self.cycle()
         state = self.states.find_one({"_id": paper_state.STATE_ID})
         self.assertIsNone(state["position"])
         self.assertEqual(state["pending_trade"]["exit_reason"], "session cutoff")
+
+    def test_evening_waits_one_minute_then_recovers_old_morning_position(self):
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            self.cycle()
+        start = datetime(2026, 11, 13, 16, 58)
+        self.now = datetime(2026, 11, 13, 17, 0, 59)
+        executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
+                           self.get_candles, self.clock, self.alerts.append,
+                           session="evening", started_at=start)
+        self.assertIsNotNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
+        self.now = datetime(2026, 11, 13, 17, 1)
+        executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
+                           self.get_candles, self.clock, self.alerts.append,
+                           session="evening", started_at=start)
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertIsNone(state["position"])
+        self.assertEqual(state["pending_trade"]["exit_reason"], "session cutoff")
+
+    def test_evening_waits_one_minute_after_late_start(self):
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            self.cycle()
+        start = datetime(2026, 11, 13, 18, 30)
+        self.now = datetime(2026, 11, 13, 18, 30, 59)
+        executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
+                           self.get_candles, self.clock, self.alerts.append,
+                           session="evening", started_at=start)
+        self.assertIsNotNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
+        self.now = datetime(2026, 11, 13, 18, 31)
+        executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
+                           self.get_candles, self.clock, self.alerts.append,
+                           session="evening", started_at=start)
+        self.assertIsNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
+
+    def test_failed_forced_exit_keeps_position_for_retry(self):
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            self.cycle()
+        self.now = datetime(2026, 11, 13, 16, 55)
+        with patch.object(self, "get_quote", side_effect=ValueError("No quote")):
+            with self.assertRaises(ValueError):
+                self.cycle()
+        self.assertIsNotNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
+        self.cycle()
+        self.assertIsNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
+
+    def test_session_stops_only_after_archive_and_does_not_stop_for_open_position(self):
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            self.cycle()
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertFalse(executor.session_finished(state, "morning", datetime(2026, 11, 13, 16, 56)))
+        self.now = datetime(2026, 11, 13, 16, 55)
+        self.cycle()
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertFalse(executor.session_finished(state, "morning", self.now))
+        paper_state.archive_trade(self.states, self.trades, state)
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertTrue(executor.session_finished(state, "morning", self.now))
 
     def test_stale_signal_never_enters(self):
         self.now = datetime(2026, 11, 13, 10, 2, 20)

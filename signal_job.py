@@ -2,7 +2,7 @@
 
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as clock_time, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import find_dotenv, load_dotenv
@@ -12,6 +12,7 @@ from tamingnifty import connect_dhan as dhan
 from tamingnifty import utils
 
 import market
+import executor
 import paper_state
 import publisher
 
@@ -35,6 +36,9 @@ def main():
                 "DHAN_PIN", "DHAN_TOTP"):
         if not os.environ.get(key, "").strip():
             raise ValueError("Missing environment variable: " + key)
+    session = os.environ.get("SILVER_SESSION", "").strip().lower()
+    if session not in ("morning", "evening"):
+        raise ValueError("SILVER_SESSION must be morning or evening")
     slack = WebClient(token=os.environ["slack_token"])
     client = MongoClient(os.environ["CONNECTION_STRING"])
     db = client["Bots"]
@@ -47,17 +51,25 @@ def main():
     last_error = None
     last_alert = now_ist()
     previous_gaps = None
-    notify(slack, "Started; publishing paper-forward-test signals")
+    notify(slack, f"Started {session}; publishing paper-forward-test signals")
     try:
         while True:
             now = now_ist()
-            if now.hour >= 23 and now.minute >= 5:
-                break
             try:
+                state = states.find_one({"_id": paper_state.STATE_ID})
+                if executor.session_finished(state, session, now):
+                    break
+                if session == "morning" and now.time() >= clock_time(16, 55):
+                    break
+                if session == "evening" and now.time() >= clock_time(23):
+                    break
                 status = market.session_status(calendars, now.date())
-                session = "morning" if now.hour < 17 else "evening"
+                if not status[session]:
+                    break
                 minute = now.replace(second=0, microsecond=0)
-                if 9 <= now.hour < 23 and status[session] and minute != last_minute:
+                active = (clock_time(9) <= now.time() < clock_time(16, 55)
+                          if session == "morning" else clock_time(17) <= now.time() < clock_time(23))
+                if active and status[session] and minute != last_minute:
                     lock = locks.find_one({"_id": "silver:" + str(now.date())})
                     if lock is None:
                         candidate = market.silver_contract(dhan.load_instruments(), calendars, now.date())
