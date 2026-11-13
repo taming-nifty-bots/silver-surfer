@@ -6,6 +6,8 @@ publication and executor startup were verified; a completed paper trade,
 scheduled restart and real-world recovery remain unverified. Live execution
 is deliberately disabled; setting `live_trading` to anything other than
 `false` stops the executor.
+At each minute boundary, the executor allows up to 15 seconds for a fresh
+signal before raising an error; fresh signals and forced exits are not delayed.
 
 `strategy.py` contains the selected Renko breakout and channel rules.
 `signals.py` builds levels from completed candles and identifies missing
