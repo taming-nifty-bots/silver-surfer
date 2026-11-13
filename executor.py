@@ -34,9 +34,13 @@ def notify(slack, message):
 def checked_signal(signals, day, session, now):
     doc = signals.find_one({"_id": f"silver:{day}:{session}"})
     if doc is None or doc.get("strategy_version") != strategy.VERSION:
+        if now.second < 15:
+            return None
         raise ValueError("Missing or incompatible Silver signal")
     candle = pd.Timestamp(doc["data_asof"])
     if candle + pd.Timedelta(minutes=1) != pd.Timestamp(now).floor("min"):
+        if now.second < 15:
+            return None
         raise ValueError("Silver signal is stale or future-dated")
     return doc
 
@@ -71,6 +75,8 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
                 alert("Best-level size was insufficient; full paper exit is optimistic")
             return
         doc = checked_signal(signals, str(now.date()), position["session"], now)
+        if doc is None:
+            return
         checked = pd.Timestamp(position["last_checked_asof"])
         asof = pd.Timestamp(doc["data_asof"])
         if asof <= checked:
@@ -119,6 +125,8 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
     if state["slot_day"] == str(now.date()) and state[session + "_used"]:
         return
     doc = checked_signal(signals, str(now.date()), session, now)
+    if doc is None:
+        return
     side = decisions.entry_decision(doc, now, status[session])
     if side is None:
         return

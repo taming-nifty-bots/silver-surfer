@@ -69,11 +69,18 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(state["pending_trade"]["exit_reason"], "session cutoff")
 
     def test_stale_signal_never_enters(self):
-        self.now = datetime(2026, 11, 13, 10, 2, 0)
+        self.now = datetime(2026, 11, 13, 10, 2, 20)
         with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
             with self.assertRaises(ValueError):
                 self.cycle()
         self.assertIsNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
+
+    def test_wait_briefly_for_publisher_without_alerting_on_normal_minute_rollover(self):
+        self.now = datetime(2026, 11, 13, 10, 2, 5)
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            self.cycle()
+        self.assertIsNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
+        self.assertEqual(self.alerts, [])
 
     def test_restart_warns_when_checks_and_candles_were_missed(self):
         with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
