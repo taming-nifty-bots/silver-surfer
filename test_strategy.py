@@ -28,7 +28,8 @@ def basic_checks():
     print("Strategy boundary checks passed")
 
 
-def replay_checks(morning_cutoff=time(17)):
+def replay_checks(morning_cutoff=time(17), evening_last_entry=time(22, 59),
+                  evening_cutoff=time(23)):
     raw = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(raw))
     import silver_micro_fresh_final_20261113 as fresh
@@ -46,11 +47,12 @@ def replay_checks(morning_cutoff=time(17)):
         day = pd.Timestamp(session["date"]).date()
         start = time(17) if session["holiday"] else time(9)
         current = data.loc[(data.day == day) & (data.datetime.dt.time >= start)
-                           & (data.datetime.dt.time <= time(23))].reset_index(drop=True)
-        history = strategy.chart_history(data, day, datetime.combine(day, time(23, 1)))
+                           & (data.datetime.dt.time <= evening_cutoff)].reset_index(drop=True)
+        history = strategy.chart_history(data, day, datetime.combine(day, evening_cutoff) + timedelta(minutes=1))
         features = {}
         for setup, box in (("morning", 0.1), ("evening", 0.15)):
-            end = datetime.combine(day, time(17)) if setup == "morning" else datetime.combine(day, time(23, 1))
+            end = (datetime.combine(day, time(17)) if setup == "morning"
+                   else datetime.combine(day, evening_cutoff) + timedelta(minutes=1))
             candles = history.loc[history.datetime < end]
             bricks = strategy.chart(candles, box)
             features[setup] = pd.merge_asof(current[["datetime"]], bricks, on="datetime", direction="backward")
@@ -66,7 +68,7 @@ def replay_checks(morning_cutoff=time(17)):
                 brick = charts[position["setup"]][i]
                 position["active"] = strategy.profit_active(position["side"], position["price"],
                                                              row["close"], position["active"])
-                cutoff = morning_cutoff if position["setup"] == "morning" else time(23)
+                cutoff = morning_cutoff if position["setup"] == "morning" else evening_cutoff
                 if clock >= cutoff or strategy.channel_exit(position["side"], brick, position["active"]):
                     direction = 1 if position["side"] == "BUY" else -1
                     results.append((str(day), position["setup"], position["side"],
@@ -75,9 +77,11 @@ def replay_checks(morning_cutoff=time(17)):
                                     float(nxt["open"]) - direction * 5))
                     position = None
                     continue
-            if position or clock >= time(23):
+            if position or clock >= evening_cutoff:
                 continue
             if morning_cutoff <= clock < time(17):
+                continue
+            if clock >= time(17) and clock > evening_last_entry:
                 continue
             setup = "morning" if clock < time(17) else "evening"
             if setup in taken:
@@ -93,7 +97,7 @@ def replay_checks(morning_cutoff=time(17)):
                                            "exit_time", "entry_price", "exit_price"])
     columns = list(actual.columns)
     wanted = expected[columns].reset_index(drop=True)
-    if morning_cutoff == time(17):
+    if morning_cutoff == time(17) and evening_cutoff == time(23) and evening_last_entry == time(22, 59):
         pd.testing.assert_frame_equal(actual, wanted, check_dtype=False)
         print(f"Holiday-aware research parity passed: {len(actual)} trades, entries, exits and prices")
     return actual
@@ -126,9 +130,37 @@ def compare_cutoffs():
             print("Changed:", row)
 
 
+def compare_evening():
+    from tamingnifty.charges import money, silver_micro_estimated_order_charges, sum_charges
+
+    old = replay_checks(time(16, 55))
+    new = replay_checks(time(16, 55), time(22, 50), time(23, 10))
+    for label, frame in (("old evening", old), ("new evening", new)):
+        values = []
+        for trade in frame.to_dict("records"):
+            direction = 1 if trade["side"] == "BUY" else -1
+            exit_side = "SELL" if trade["side"] == "BUY" else "BUY"
+            fees = sum_charges(silver_micro_estimated_order_charges(trade["side"], trade["entry_price"], 1),
+                               silver_micro_estimated_order_charges(exit_side, trade["exit_price"], 1))
+            values.append(money(direction * (trade["exit_price"] - trade["entry_price"]) - fees["total"]))
+        wins = [value for value in values if value > 0]
+        losses = [value for value in values if value < 0]
+        print(f"{label}: trades={len(values)}, estimated_net={money(sum(values))}, wins={len(wins)}, "
+              f"losses={len(losses)}, profit_factor={sum(wins) / -sum(losses):.3f}")
+    compared = old.merge(new, on=["date", "setup"], how="outer", suffixes=("_old", "_new"),
+                         indicator=True)
+    for row in compared.to_dict("records"):
+        if (row["_merge"] != "both" or row["entry_time_old"] != row["entry_time_new"]
+                or row["exit_time_old"] != row["exit_time_new"]
+                or row["exit_price_old"] != row["exit_price_new"]):
+            print("Changed:", row)
+
+
 if __name__ == "__main__":
     basic_checks()
     if "--replay" in sys.argv:
         replay_checks()
     if "--compare-cutoff" in sys.argv:
         compare_cutoffs()
+    if "--compare-evening" in sys.argv:
+        compare_evening()

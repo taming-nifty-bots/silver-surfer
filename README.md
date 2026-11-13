@@ -6,6 +6,10 @@ evening jobs start at 16:58 IST, subject to the MCX calendar. Morning entries
 end at 16:55, when any open morning position is force-exited. After a session's
 trade is closed and archived, its jobs stop. If a morning position remains open
 at 17:00, the evening executor waits one minute and then retries its exit.
+Evening entries are permitted no later than 22:50:00 IST; any open evening
+position is force-exited starting at 23:10 IST. Quote or service failures
+can delay the simulated fill, so the executor continues retrying and alerts.
+The prior 23:00-cutoff replay does not validate these changed evening rules.
 Signal publication and executor startup were verified for the earlier
 single-day deployment; a completed paper trade, scheduled restart and
 real-world recovery remain unverified. Live execution

@@ -51,7 +51,7 @@ def session_gaps(candles, day, as_of, morning_open, evening_open):
             expected.extend(pd.date_range(first, last, freq="min"))
     if evening_open:
         first = datetime.combine(day, time(17))
-        last = min(end, pd.Timestamp(datetime.combine(day, time(22, 59))))
+        last = min(end, pd.Timestamp(datetime.combine(day, time(23, 9))))
         if last >= first:
             expected.extend(pd.date_range(first, last, freq="min"))
     return [str(stamp) for stamp in expected if stamp not in observed]

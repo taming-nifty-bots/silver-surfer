@@ -55,8 +55,9 @@ def session_finished(state, session, now):
                 and now.time() >= clock_time(17))
     if state["slot_day"] == str(now.date()) and state[session + "_used"]:
         return True
-    cutoff = clock_time(16, 55) if session == "morning" else clock_time(23)
-    return now.time() >= cutoff and (session == "evening" or now.time() < clock_time(23))
+    if session == "evening":
+        return now.time() > strategy.EVENING_LAST_ENTRY
+    return now.time() >= clock_time(16, 55) and now.time() < clock_time(23)
 
 
 def run_cycle(states, trades, signals, calendars, quote_source, candles_source, clock, alert,
@@ -87,7 +88,7 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
             now.date() > pd.Timestamp(position["entry_timestamp"]).date()
             or now.time() >= (datetime.strptime("16:55", "%H:%M").time()
                               if position["session"] == "morning"
-                              else datetime.strptime("23:00", "%H:%M").time())) else None
+                              else strategy.EVENING_EXIT)) else None
         if cutoff is not None:
             quote, started, received = quote_source(position["security_id"])
             trade = paper_state.close_position(states, state, cutoff["reason"], quote, started, received)
@@ -127,7 +128,7 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
         current = clock()
         if current.date() > pd.Timestamp(position["entry_timestamp"]).date() or (
                 position["session"] == "morning" and current.time() >= clock_time(16, 55)) or (
-                position["session"] == "evening" and current.hour >= 23):
+                position["session"] == "evening" and current.time() >= strategy.EVENING_EXIT):
             result["reason"] = result["reason"] or "session cutoff"
         if result["reason"] is not None:
             state = paper_state.request_exit(states, state, result["reason"], result["profit_active"])
@@ -147,6 +148,8 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
     if session == "morning" and now.time() >= clock_time(16, 55):
         return
     if session == "evening" and now.time() < clock_time(17):
+        return
+    if session == "evening" and now.time() > strategy.EVENING_LAST_ENTRY:
         return
     if state["slot_day"] == str(now.date()) and state[session + "_used"]:
         return

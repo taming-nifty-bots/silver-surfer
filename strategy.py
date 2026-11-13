@@ -8,6 +8,8 @@ from tamingnifty import ta
 
 
 VERSION = "silver-renko-40-10-to-7-2026-11-13"
+EVENING_LAST_ENTRY = time(22, 50)
+EVENING_EXIT = time(23, 10)
 
 
 def chart_history(candles, day, as_of):

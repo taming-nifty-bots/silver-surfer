@@ -64,6 +64,21 @@ class DecisionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             decisions.exit_decision(trade(), None, "2026-11-13 16:54")
 
+    def test_evening_entry_deadline_is_exact(self):
+        doc = dict(signal(), session="evening", data_asof="2026-11-13 22:49:00",
+                   brick_time="2026-11-13 22:49:00")
+        self.assertEqual(decisions.entry_decision(doc, "2026-11-13 22:50:00", True), "BUY")
+        self.assertIsNone(decisions.entry_decision(doc, "2026-11-13 22:50:00.001", True))
+        doc.update(data_asof="2026-11-13 22:50:00", brick_time="2026-11-13 22:50:00")
+        self.assertIsNone(decisions.entry_decision(doc, "2026-11-13 22:51:00", True))
+
+    def test_evening_exit_cutoff(self):
+        position = dict(trade(), session="evening", entry_timestamp="2026-11-13 22:00:00")
+        with self.assertRaises(ValueError):
+            decisions.exit_decision(position, None, "2026-11-13 23:09:59")
+        self.assertEqual(decisions.exit_decision(position, None, "2026-11-13 23:10:00")["reason"],
+                         "session cutoff")
+
     def test_contract_mismatch_and_old_signal(self):
         doc = deepcopy(signal())
         doc["security_id"] = "102"

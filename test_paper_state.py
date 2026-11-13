@@ -152,6 +152,15 @@ class PaperStateTests(unittest.TestCase):
             paper_state.open_position(self.states, self.state, signal(), bad, quote(),
                                       "2026-11-13 10:01:01", "2026-11-13 10:01:02")
 
+    def test_evening_quote_received_after_deadline_does_not_fill(self):
+        evening = signal("evening", "2026-11-13 22:49:00")
+        with self.assertRaises(ValueError):
+            self.open(doc=evening, start="2026-11-13 22:50:00",
+                      end="2026-11-13 22:50:00.001")
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertIsNone(state["position"])
+        self.assertFalse(state["evening_used"])
+
 
 if __name__ == "__main__":
     unittest.main()

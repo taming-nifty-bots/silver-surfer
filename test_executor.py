@@ -68,6 +68,77 @@ class ExecutorTests(unittest.TestCase):
         self.assertIsNone(state["position"])
         self.assertEqual(state["pending_trade"]["exit_reason"], "session cutoff")
 
+    def test_evening_position_is_managed_after_23_and_forced_at_2310(self):
+        self.now = datetime(2026, 11, 13, 22, 1)
+        self.doc.update(_id="silver:2026-11-13:evening", session="evening",
+                        data_asof="2026-11-13 22:00:00", brick_time="2026-11-13 22:00:00")
+        self.signals.insert_one(self.doc)
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            self.cycle()
+        self.now = datetime(2026, 11, 13, 23, 9, 20)
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertFalse(executor.session_finished(state, "evening", self.now))
+        self.signals.docs.clear()
+        with self.assertRaises(ValueError):
+            self.cycle()
+        self.assertIsNotNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
+        self.now = datetime(2026, 11, 13, 23, 10, 0)
+        with patch("executor.market.session_status", side_effect=RuntimeError("calendar unavailable")):
+            self.cycle()
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertEqual(state["pending_trade"]["exit_reason"], "session cutoff")
+        self.assertEqual(state["pending_trade"]["exit_timestamp"], "2026-11-13 23:10:00")
+
+    def test_evening_no_position_stops_after_entry_deadline(self):
+        state = paper_state.create_state(self.states)
+        self.assertFalse(executor.session_finished(state, "evening", datetime(2026, 11, 13, 22, 50)))
+        self.assertTrue(executor.session_finished(state, "evening", datetime(2026, 11, 13, 22, 50, 1)))
+
+    def test_evening_fresh_signal_manages_position_after_23(self):
+        self.now = datetime(2026, 11, 13, 22, 1)
+        self.doc.update(_id="silver:2026-11-13:evening", session="evening",
+                        data_asof="2026-11-13 22:00:00", brick_time="2026-11-13 22:00:00")
+        self.signals.insert_one(self.doc)
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            self.cycle()
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        paper_state.checkpoint_signal(self.states, state, False, "2026-11-13 23:07:00")
+        self.doc.update(data_asof="2026-11-13 23:08:00", candle_close=99000, close=96000)
+        self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
+        self.now = datetime(2026, 11, 13, 23, 9, 20)
+        with patch.object(self, "get_candles", return_value=pd.DataFrame(
+                [dict(datetime="2026-11-13 23:08", close=99000)])):
+            self.cycle()
+        trade = self.states.find_one({"_id": paper_state.STATE_ID})["pending_trade"]
+        self.assertEqual(trade["exit_reason"], "channel10")
+
+    def test_evening_cutoff_during_candle_fetch_and_failed_quote_retry(self):
+        self.now = datetime(2026, 11, 13, 22, 1)
+        self.doc.update(_id="silver:2026-11-13:evening", session="evening",
+                        data_asof="2026-11-13 22:00:00", brick_time="2026-11-13 22:00:00")
+        self.signals.insert_one(self.doc)
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            self.cycle()
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        paper_state.checkpoint_signal(self.states, state, False, "2026-11-13 23:07:00")
+        self.doc.update(data_asof="2026-11-13 23:08:00", candle_close=99000, close=99000)
+        self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
+        self.now = datetime(2026, 11, 13, 23, 9, 59)
+
+        def late_candles(position):
+            self.now = datetime(2026, 11, 13, 23, 10)
+            return pd.DataFrame([dict(datetime="2026-11-13 23:08", close=99000)])
+
+        with patch.object(self, "get_candles", side_effect=late_candles), \
+                patch.object(self, "get_quote", side_effect=ValueError("No quote")):
+            with self.assertRaises(ValueError):
+                self.cycle()
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertEqual(state["position"]["exit_requested"], "session cutoff")
+        self.cycle()
+        trade = self.states.find_one({"_id": paper_state.STATE_ID})["pending_trade"]
+        self.assertEqual(trade["exit_reason"], "session cutoff")
+
     def test_evening_waits_one_minute_then_recovers_old_morning_position(self):
         with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
             self.cycle()

@@ -15,6 +15,7 @@ import market
 import executor
 import paper_state
 import publisher
+import strategy
 
 
 def now_ist():
@@ -61,14 +62,14 @@ def main():
                     break
                 if session == "morning" and now.time() >= clock_time(16, 55):
                     break
-                if session == "evening" and now.time() >= clock_time(23):
+                if session == "evening" and now.time() >= strategy.EVENING_EXIT:
                     break
                 status = market.session_status(calendars, now.date())
                 if not status[session]:
                     break
                 minute = now.replace(second=0, microsecond=0)
                 active = (clock_time(9) <= now.time() < clock_time(16, 55)
-                          if session == "morning" else clock_time(17) <= now.time() < clock_time(23))
+                          if session == "morning" else clock_time(17) <= now.time() < strategy.EVENING_EXIT)
                 if active and status[session] and minute != last_minute:
                     lock = locks.find_one({"_id": "silver:" + str(now.date())})
                     if lock is None:

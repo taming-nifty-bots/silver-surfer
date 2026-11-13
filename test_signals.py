@@ -35,6 +35,12 @@ class SignalTests(unittest.TestCase):
                 signals.build_signal(bars, "2026-11-13", datetime(2026, 11, 13, 17, 2),
                                      "evening")
 
+    def test_gap_detection_covers_after_23_until_last_managed_candle(self):
+        bars = pd.DataFrame({"datetime": pd.date_range("2026-11-13 17:00", "2026-11-13 23:09",
+                                                       freq="min").delete(365)})
+        gaps = signals.session_gaps(bars, "2026-11-13", "2026-11-13 23:09", False, True)
+        self.assertEqual(gaps, ["2026-11-13 23:05:00"])
+
 
 if __name__ == "__main__":
     unittest.main()
