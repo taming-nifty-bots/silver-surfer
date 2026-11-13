@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from threading import Barrier, RLock
+from threading import RLock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -148,16 +148,16 @@ class PaperStateTests(unittest.TestCase):
         return paper_state.open_position(self.trades, state or self.state,
                                         doc or signal(), contract(), quantity, quote(), start, end)
 
-    def request(self, reason="channel10"):
-        return paper_state.request_exit(self.trades, paper_state.create_state(self.trades), reason, False)
-
     def close(self, reason="channel10", start="2026-11-13 10:02:01", end="2026-11-13 10:02:02"):
-        return paper_state.close_position(self.trades, self.request(reason), reason, quote(), start, end)
+        return paper_state.close_position(self.trades, paper_state.create_state(self.trades),
+                                          reason, quote(), start, end)
 
     def test_competing_entries_and_restart_preserve_one_position(self):
         position = self.open()
         self.assertEqual(position["entry_price"], 99000)
         self.assertNotIn("id", position)
+        for field in ("profit_active", "occupied_minutes", "exit_requested"):
+            self.assertNotIn(field, position)
         self.assertIsNone(position["net_pnl"])
         self.assertEqual(position["strategy_version"], strategy.VERSION)
         self.assertEqual(position["instrument_name"], "SILVERMIC")
@@ -227,41 +227,13 @@ class PaperStateTests(unittest.TestCase):
                       "2026-11-13 17:01:01", "2026-11-13 17:01:02")
         self.assertEqual(len(self.trades.docs), 1)
 
-    def test_stale_snapshot_cannot_enter_in_exit_minute(self):
+    def test_stale_snapshot_can_enter_in_exit_minute_without_reservation(self):
         stale = self.state
         self.open()
         self.close("cutoff", "2026-11-13 17:00:00", "2026-11-13 17:00:01")
-        with self.assertRaises(RuntimeError):
-            self.open(stale, signal("evening", "2026-11-13 16:59:00"),
-                      "2026-11-13 17:00:02", "2026-11-13 17:00:03")
-        self.assertEqual(len(self.trades.docs), 1)
-
-    def test_concurrent_exit_and_same_minute_entry_cannot_handoff(self):
-        stale = self.state
-        self.open()
-        closing = self.request("cutoff")
-        barrier = Barrier(2)
-
-        def close():
-            barrier.wait()
-            return paper_state.close_position(self.trades, closing, "cutoff", quote(),
-                                              "2026-11-13 17:00:00", "2026-11-13 17:00:01")
-
-        def enter():
-            barrier.wait()
-            try:
-                self.open(stale, signal("evening", "2026-11-13 16:59:00"),
-                          "2026-11-13 17:00:02", "2026-11-13 17:00:03")
-            except RuntimeError:
-                return False
-            return True
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            closed = pool.submit(close)
-            entered = pool.submit(enter)
-            self.assertEqual(closed.result()["strategy_state"], "closed")
-            self.assertFalse(entered.result())
-        self.assertEqual(len(self.trades.docs), 1)
+        self.open(stale, signal("evening", "2026-11-13 16:59:00"),
+                  "2026-11-13 17:00:02", "2026-11-13 17:00:03")
+        self.assertEqual(len(self.trades.docs), 2)
 
     def test_short_pnl_and_charges(self):
         self.open(doc=signal(side="SELL"), quantity=3)
@@ -335,52 +307,37 @@ class PaperStateTests(unittest.TestCase):
                   "2026-11-13 17:01:01", "2026-11-13 17:01:02")
         self.assertEqual(len(self.trades.docs), 2)
 
-    def test_activation_cannot_be_reset_or_updated_by_stale_worker(self):
+    def test_checkpoint_rejects_stale_worker(self):
         self.open()
         old = paper_state.create_state(self.trades)
-        new = paper_state.update_activation(self.trades, old, True)
-        self.assertTrue(new["position"]["profit_active"])
-        with self.assertRaises(ValueError):
-            paper_state.update_activation(self.trades, new, False)
+        paper_state.checkpoint_signal(self.trades, old, "2026-11-13 10:01:00")
         with self.assertRaises(RuntimeError):
-            paper_state.update_activation(self.trades, old, True)
+            paper_state.checkpoint_signal(self.trades, old, "2026-11-13 10:01:00")
 
-    def test_exit_intent_survives_restart_and_stale_updates_fail(self):
+    def test_stale_close_fails_after_another_worker_closes(self):
         self.open()
         old = paper_state.create_state(self.trades)
-        state = self.request()
         restarted = paper_state.create_state(self.trades)
-        self.assertEqual(restarted["position"]["exit_requested"], "channel10")
-        with self.assertRaises(RuntimeError):
-            paper_state.checkpoint_signal(self.trades, old, True, "2026-11-13 10:01:00")
         trade = paper_state.close_position(self.trades, restarted, "channel10", quote(),
                                           "2026-11-13 10:02:01", "2026-11-13 10:02:02")
         with self.assertRaises(RuntimeError):
-            paper_state.close_position(self.trades, state, "channel10", quote(),
+            paper_state.close_position(self.trades, old, "channel10", quote(),
                                        "2026-11-13 10:02:01", "2026-11-13 10:02:02")
         self.assertEqual(self.trades.find_one({"_id": trade["_id"]}), trade)
 
-    def test_close_without_persisted_exit_intent_is_rejected(self):
-        self.open()
-        with self.assertRaises(ValueError):
-            paper_state.close_position(self.trades, paper_state.create_state(self.trades),
-                                       "cutoff", quote(), "2026-11-13 16:55", "2026-11-13 16:55")
-
     def test_exit_quote_cannot_start_before_entry(self):
         self.open()
-        state = self.request()
+        state = paper_state.create_state(self.trades)
         with self.assertRaises(ValueError):
             paper_state.close_position(self.trades, state, "channel10", quote(),
                                        "2026-11-13 10:01:01", "2026-11-13 10:01:03")
-        self.assertEqual(paper_state.create_state(self.trades)["position"]["exit_requested"], "channel10")
+        self.assertIsNotNone(paper_state.create_state(self.trades)["position"])
 
     def test_startup_creates_required_index_and_fails_on_incompatible_index(self):
         self.assertEqual(self.trades.indexes["silver_one_active_trade"],
                          dict(key=[("strategy_state", 1)], name="silver_one_active_trade",
                               unique=True, partialFilterExpression={"strategy_state": "active"}))
-        self.assertEqual(self.trades.indexes["silver_occupied_minutes"],
-                         dict(key=[("occupied_minutes", 1)], name="silver_occupied_minutes",
-                              unique=True, partialFilterExpression={"occupied_minutes": {"$exists": True}}))
+        self.assertNotIn("silver_occupied_minutes", self.trades.indexes)
         self.trades.indexes["silver_one_active_trade"]["unique"] = False
         with self.assertRaises(OperationFailure):
             paper_state.initialize_store(self.trades)
@@ -392,16 +349,14 @@ class PaperStateTests(unittest.TestCase):
             paper_state.initialize_store(self.trades)
         self.assertEqual(self.trades.find_one({"_id": legacy["_id"]}), legacy)
 
-    def test_startup_rejects_trade_without_minute_reservation(self):
+    def test_startup_accepts_trade_without_minute_reservation(self):
         position = self.open()
-        del self.trades.docs[position["_id"]]["occupied_minutes"]
-        with self.assertRaises(RuntimeError):
-            paper_state.initialize_store(self.trades)
+        paper_state.initialize_store(self.trades)
+        self.assertEqual(self.trades.find_one({"_id": position["_id"]}), position)
 
     def test_startup_rejects_multiple_active_trades(self):
         position = self.open()
         del self.trades.indexes["silver_one_active_trade"]
-        del self.trades.indexes["silver_occupied_minutes"]
         other = dict(position, _id="silver:2026-11-13:evening", session="evening")
         self.trades.insert_one(other)
         with self.assertRaises((RuntimeError, DuplicateKeyError)):
@@ -532,8 +487,8 @@ class DecisionTests(unittest.TestCase):
         self.assertTrue(decisions.recover_activation(trade(), candles, "2026-11-13 10:02"))
         candles.loc[2, "close"] = 100000
         self.assertFalse(decisions.recover_activation(trade(), candles, "2026-11-13 10:02"))
-        self.assertTrue(decisions.recover_activation(dict(trade(), profit_active=True),
-                                                     candles, "2026-11-13 10:02"))
+        self.assertFalse(decisions.recover_activation(dict(trade(), profit_active=True),
+                                                      candles, "2026-11-13 10:02"))
 
     def test_recovery_excludes_unfinished_bar_and_rejects_duplicates(self):
         candles = pd.DataFrame([
@@ -562,6 +517,18 @@ class DecisionTests(unittest.TestCase):
             result = decisions.recover_missed_exit(position, candles, "2026-11-13 10:01")
         self.assertEqual(result, dict(reason="channel7", profit_active=True,
                                       data_asof="2026-11-13 10:01:00"))
+
+    def test_recovery_reconstructs_activation_before_checkpoint(self):
+        position = dict(trade(), last_checked_asof="2026-11-13 10:00:00")
+        del position["profit_active"]
+        candles = pd.DataFrame([dict(datetime="2026-11-13 09:59", close=101000),
+                                dict(datetime="2026-11-13 10:00", close=100000),
+                                dict(datetime="2026-11-13 10:01", close=99000)])
+        current = dict(decision_signal(), data_asof="2026-11-13 10:01:00",
+                       candle_close=99000, close=99000, lower7=100000)
+        with patch("strategy.build_signal", return_value=current):
+            result = decisions.recover_missed_exit(position, candles, "2026-11-13 10:01")
+        self.assertEqual(result["reason"], "channel7")
 
 
 def failed_alert(message):
@@ -786,7 +753,7 @@ class ExecutorTests(unittest.TestCase):
         with patch("strategy.session_status", return_value=dict(morning=True, evening=True)):
             self.cycle()
         state = paper_state.create_state(self.trades)
-        paper_state.checkpoint_signal(self.trades, state, False, "2026-11-13 23:07:00")
+        paper_state.checkpoint_signal(self.trades, state, "2026-11-13 23:07:00")
         self.doc.update(data_asof="2026-11-13 23:08:00", candle_close=99000, close=96000)
         self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
         self.now = datetime(2026, 11, 13, 23, 9, 20)
@@ -804,7 +771,7 @@ class ExecutorTests(unittest.TestCase):
         with patch("strategy.session_status", return_value=dict(morning=True, evening=True)):
             self.cycle()
         state = paper_state.create_state(self.trades)
-        paper_state.checkpoint_signal(self.trades, state, False, "2026-11-13 23:07:00")
+        paper_state.checkpoint_signal(self.trades, state, "2026-11-13 23:07:00")
         self.doc.update(data_asof="2026-11-13 23:08:00", candle_close=99000, close=99000)
         self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
         self.now = datetime(2026, 11, 13, 23, 9, 59)
@@ -818,7 +785,7 @@ class ExecutorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.cycle()
         state = paper_state.create_state(self.trades)
-        self.assertEqual(state["position"]["exit_requested"], "session cutoff")
+        self.assertNotIn("exit_requested", state["position"])
         self.cycle()
         trade = self.trades.find_one({"_id": "silver:2026-11-13:evening"})
         self.assertEqual(trade["exit_reason"], "session cutoff")
@@ -930,12 +897,16 @@ class ExecutorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.cycle()
         state = paper_state.create_state(self.trades)
-        self.assertTrue(state["position"]["profit_active"])
+        self.assertNotIn("profit_active", state["position"])
         self.assertEqual(state["position"]["last_checked_asof"], "2026-11-13 10:00:00")
-        self.assertEqual(state["position"]["exit_requested"], "channel7")
-        self.signals.docs.clear()
+        self.assertNotIn("exit_requested", state["position"])
         self.now = datetime(2026, 11, 13, 10, 4, 2)
-        self.cycle()
+        self.doc.update(data_asof="2026-11-13 10:03:00", brick_time="2026-11-13 10:03:00")
+        self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
+        with patch("strategy.recover_missed_exit",
+                   return_value=dict(reason="channel7", profit_active=True,
+                                     data_asof="2026-11-13 10:01:00")):
+            self.cycle()
         self.assertEqual(self.trades.find_one({"_id": "silver:2026-11-13:morning"})["exit_reason"],
                          "channel7")
 

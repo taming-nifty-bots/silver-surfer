@@ -243,7 +243,7 @@ def recover_activation(trade, candles, now):
     bars = bars.sort_values("datetime").reset_index(drop=True)
     if bars["datetime"].duplicated().any():
         raise ValueError("Duplicate candles during activation recovery")
-    active = trade["profit_active"]
+    active = False
     for row in bars.to_dict("records"):
         active = profit_active(trade["side"], trade["entry_price"], row["close"], active)
     return active
@@ -313,7 +313,7 @@ def recover_missed_exit(trade, candles, asof):
         raise ValueError("Invalid exit recovery interval")
     frame = frame.loc[(frame["datetime"] >= start) & (frame["datetime"] <= end)]
     frame = frame.sort_values("datetime")
-    active = trade["profit_active"]
+    active = recover_activation(trade, candles, start)
     for stamp in frame["datetime"]:
         signal = build_signal(candles, stamp.date(), stamp + pd.Timedelta(minutes=1),
                               trade["session"])

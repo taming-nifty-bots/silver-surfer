@@ -71,20 +71,16 @@ def initialize_store(trades):
         if (trade.get("strategy_state") not in ("active", "closed")
                 or not all(key in trade for key in
                            ("_id", "session", "entry_timestamp", "entry_price", "quantity",
-                            "version", "occupied_minutes"))
+                            "version"))
                 or ("id" in trade and trade["_id"] != trade["id"])
                 or trade["session"] not in ("morning", "evening")):
             raise RuntimeError("Legacy or invalid paper data; reconcile and migrate before startup")
-        minutes = [str(valid_time(trade["entry_timestamp"]).floor("min"))]
         day = str(valid_time(trade["entry_timestamp"]).date())
         if trade["_id"] != f"silver:{day}:{trade['session']}":
             raise RuntimeError("Invalid paper trade ID; reconcile before startup")
         if trade["strategy_state"] == "closed":
             if valid_time(trade["exit_timestamp"]) < valid_time(trade["entry_timestamp"]):
                 raise RuntimeError("Invalid paper exit time; reconcile before startup")
-            minutes.append(str(valid_time(trade["exit_timestamp"]).floor("min")))
-        if trade["occupied_minutes"] != minutes:
-            raise RuntimeError("Invalid paper trade minutes; reconcile before startup")
         if trade["strategy_state"] == "closed" and "id" in trade:
             result = trades.update_one({"_id": trade["_id"], "id": trade["_id"],
                                         "version": trade["version"], "strategy_state": "closed"},
@@ -93,9 +89,6 @@ def initialize_store(trades):
                 raise RuntimeError("Could not remove duplicate ID from closed paper trade")
     trades.create_index([("strategy_state", 1)], name="silver_one_active_trade",
                         unique=True, partialFilterExpression={"strategy_state": "active"})
-    # A close atomically releases the active slot and reserves its exit minute.
-    trades.create_index([("occupied_minutes", 1)], name="silver_occupied_minutes",
-                        unique=True, partialFilterExpression={"occupied_minutes": {"$exists": True}})
 
 
 def create_state(trades):
@@ -191,8 +184,7 @@ def open_position(trades, state, signal, contract, quantity, quote, started_at, 
                     entry_timestamp=str(received), entry_quote=fill,
                     entry_signal=str(asof), signal_doc_id=f"silver:{signal['session']}",
                     last_checked_asof=str(asof),
-                    occupied_minutes=[str(received.floor("min"))],
-                    profit_active=False, exit_requested=None, strategy_state="active", version=0,
+                    strategy_state="active", version=0,
                     pnl=0.0, net_pnl=None, running_pnl=0.0,
                     max_pnl_reached=0.0, min_pnl_reached=0.0,
                     last_mark=str(received), pnl_tracking_since=str(received),
@@ -225,57 +217,20 @@ def mark_position(trades, position, price, marked_at):
         raise RuntimeError("Paper P&L mark lost a concurrent trade update")
 
 
-def update_activation(trades, state, active):
-    if state["position"] is None or not isinstance(active, bool):
-        raise ValueError("A paper position and boolean activation are required")
-    if state["position"]["profit_active"] and not active:
-        raise ValueError("Paper profit activation cannot be reset")
-    if state["position"]["profit_active"] == active:
-        return state
+def checkpoint_signal(trades, state, asof):
     position = state["position"]
-    result = trades.update_one({"_id": position["_id"], "version": position["version"],
-                                "strategy_state": "active", "exit_requested": None},
-                               {"$set": {"profit_active": active},
-                                "$inc": {"version": 1}})
-    if result.modified_count != 1:
-        raise RuntimeError("Paper activation lost a concurrent state update")
-    return dict(state, position=dict(position, profit_active=active, version=position["version"] + 1))
-
-
-def checkpoint_signal(trades, state, active, asof):
-    position = state["position"]
-    if position is None or not isinstance(active, bool):
-        raise ValueError("A paper position and boolean activation are required")
-    if position["profit_active"] and not active:
-        raise ValueError("Paper profit activation cannot be reset")
+    if position is None:
+        raise ValueError("A paper position is required")
     current = valid_time(asof)
     if current < valid_time(position["last_checked_asof"]):
         raise ValueError("Cannot move the position checkpoint backwards")
     result = trades.update_one({"_id": position["_id"], "version": position["version"],
-                                "strategy_state": "active", "exit_requested": None},
-                               {"$set": {"profit_active": active,
-                                         "last_checked_asof": str(current)},
+                                "strategy_state": "active"},
+                               {"$set": {"last_checked_asof": str(current)},
                                 "$inc": {"version": 1}})
     if result.modified_count != 1:
         raise RuntimeError("Paper checkpoint lost a concurrent state update")
-    return dict(state, position=dict(position, profit_active=active, last_checked_asof=str(current),
-                                     version=position["version"] + 1))
-
-
-def request_exit(trades, state, reason, active):
-    position = state["position"]
-    if position is None or not isinstance(reason, str) or not reason.strip() or not isinstance(active, bool):
-        raise ValueError("A paper position, exit reason and boolean activation are required")
-    if position["profit_active"] and not active:
-        raise ValueError("Paper profit activation cannot be reset")
-    result = trades.update_one({"_id": position["_id"], "version": position["version"],
-                                "strategy_state": "active", "exit_requested": None},
-                               {"$set": {"profit_active": active,
-                                         "exit_requested": reason},
-                                "$inc": {"version": 1}})
-    if result.modified_count != 1:
-        raise RuntimeError("Paper exit request lost a concurrent state update")
-    return dict(state, position=dict(position, profit_active=active, exit_requested=reason,
+    return dict(state, position=dict(position, last_checked_asof=str(current),
                                      version=position["version"] + 1))
 
 
@@ -285,8 +240,6 @@ def close_position(trades, state, reason, quote, started_at, received_at):
         raise ValueError("No paper position available to close")
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("Paper exit reason is required")
-    if position["exit_requested"] != reason:
-        raise ValueError("Persist the matching exit intent before requesting a quote")
     received = valid_time(received_at)
     if valid_time(started_at) < valid_time(position["entry_timestamp"]):
         raise ValueError("Exit quote precedes entry")
@@ -301,7 +254,6 @@ def close_position(trades, state, reason, quote, started_at, received_at):
                  exit_price=fill["price"],
                  exit_date=str(received.date()), exit_time=received.strftime("%H:%M:%S"),
                  exit_timestamp=str(received), exit_quote=fill, exit_reason=reason,
-                 occupied_minutes=position["occupied_minutes"] + [str(received.floor("min"))],
                  pnl=pnl, running_pnl=pnl, last_mark=str(received),
                  max_pnl_reached=max(position.get("max_pnl_reached", pnl), pnl),
                  min_pnl_reached=min(position.get("min_pnl_reached", pnl), pnl),
@@ -310,7 +262,7 @@ def close_position(trades, state, reason, quote, started_at, received_at):
     values = dict(trade)
     del values["_id"]
     result = trades.update_one({"_id": position["_id"], "version": position["version"],
-                                "strategy_state": "active", "exit_requested": reason},
+                                "strategy_state": "active"},
                                {"$set": values, "$unset": {"id": ""}})
     if result.modified_count != 1:
         raise RuntimeError("Paper exit lost a concurrent state update; no fill recorded")
@@ -359,21 +311,12 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
                 return
             if position["session"] == "evening" and session == "morning" and now.date() == pd.Timestamp(position["entry_timestamp"]).date():
                 return
-        if position["exit_requested"] is not None:
-            quote, started, received = quote_source(position["security_id"])
-            trade = close_position(trades, state, position["exit_requested"],
-                                               quote, started, received)
-            alert(f"Exit {trade['_id']} at {trade['exit_price']}; estimated net {trade['net_pnl']}")
-            if trade["exit_quote"]["insufficient_best_size"]:
-                alert("Best-level size was insufficient; full paper exit is optimistic")
-            return
-        cutoff = strategy.exit_decision(position, None, now) if (
+        cutoff = strategy.exit_decision(dict(position, profit_active=False), None, now) if (
             now.date() > pd.Timestamp(position["entry_timestamp"]).date()
             or now.time() >= (datetime.strptime("16:55", "%H:%M").time()
                               if position["session"] == "morning"
                               else strategy.EVENING_EXIT)) else None
         if cutoff is not None:
-            state = request_exit(trades, state, cutoff["reason"], position["profit_active"])
             quote, started, received = quote_source(position["security_id"])
             trade = close_position(trades, state, cutoff["reason"], quote, started, received)
             alert(f"Forced exit {trade['_id']} at {trade['exit_price']}; "
@@ -393,8 +336,7 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
         if asof > checked + pd.Timedelta(minutes=1):
             alert(f"Position {position['_id']} missed signal checks after {checked}; "
                   "reconstructing observed candles; any missed exit uses a current quote.")
-        expected = pd.date_range(max(checked + pd.Timedelta(minutes=1),
-                                     pd.Timestamp(position["entry_timestamp"]).floor("min")),
+        expected = pd.date_range(pd.Timestamp(position["entry_timestamp"]).floor("min"),
                                  asof, freq="min")
         observed = set(pd.to_datetime(candles["datetime"]))
         missing = [str(stamp) for stamp in expected if stamp not in observed]
@@ -415,14 +357,13 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
                 position["session"] == "evening" and current.time() >= strategy.EVENING_EXIT):
             result["reason"] = result["reason"] or "session cutoff"
         if result["reason"] is not None:
-            state = request_exit(trades, state, result["reason"], result["profit_active"])
             quote, started, received = quote_source(position["security_id"])
             trade = close_position(trades, state, result["reason"], quote, started, received)
             alert(f"Exit {trade['_id']} at {trade['exit_price']}; estimated net {trade['net_pnl']}")
             if trade["exit_quote"]["insufficient_best_size"]:
                 alert("Best-level size was insufficient; full paper exit is optimistic")
         else:
-            checkpoint_signal(trades, state, result["profit_active"], asof)
+            checkpoint_signal(trades, state, asof)
         return
 
     status = strategy.session_status(calendars, now.date())

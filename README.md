@@ -42,7 +42,9 @@ The MCX calendar remains shared in `Bots.exchange_calendars`.
 construction and recovery helpers. `signal/signal_job.py` publishes the contract
 lock and independently rebuilt session signals. `executor/executor.py` handles quotes, paper
 trades, recovery and configured quantity. Entry and exit are recorded in the
-same trade document, with an exit intent saved before requesting a quote.
+same trade document. A failed channel-exit quote leaves the signal checkpoint
+unchanged so the exit can be reconstructed when fresh candles and signals are
+available. Forced exits retry without a signal.
 Paper BUYs use the best ask and SELLs the best bid, with no spread filter.
 Insufficient best-level size is recorded and alerted, but the full paper fill
 is optimistic. Request duration is checked; the REST response does not establish
@@ -56,7 +58,11 @@ Daily contract locks and open-position contract checks are implemented.
 The jobs alert on missing observed candles and continue, as requested. On
 restart, missed observed candles are reconstructed for activation and channel
 exits; missed exits fill only at a current quote. Unobserved candles cannot
-be reconstructed. Alert channel defaults to `silver-surfer`. Paper trade
+be reconstructed. Activation is recalculated from completed candle closes
+since entry, not from LTP-based maximum P&L. Removing the minute-reservation
+index means a stale concurrent executor can enter in the same minute another
+executor closes a trade, although a fresh state check blocks that handoff.
+Alert channel defaults to `silver-surfer`. Paper trade
 charges are estimates, not reconciled Dhan contract-note rates.
 
 For offline tests, make the `tamingnifty` source or installed package available:
