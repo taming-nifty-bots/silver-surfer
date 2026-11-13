@@ -34,7 +34,8 @@ While a trade is open, `running_pnl`, `max_pnl_reached` and `min_pnl_reached`
 are gross estimates based on commodity LTP, not executable bid/ask or net
 P&L. `last_mark` records the mark time. `pnl_tracking_since` identifies when
 extrema tracking began; older untracked periods cannot be reconstructed.
-On closure `pnl` is gross and `net_pnl` deducts estimated itemized charges.
+`net_pnl` is null until closure; then `pnl` is gross and `net_pnl` deducts
+estimated itemized charges.
 The MCX calendar remains shared in `Bots.exchange_calendars`.
 
 `strategy.py` contains the calendar, contract selection, Renko rules, signal

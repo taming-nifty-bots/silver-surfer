@@ -158,6 +158,7 @@ class PaperStateTests(unittest.TestCase):
         position = self.open()
         self.assertEqual(position["entry_price"], 99000)
         self.assertNotIn("id", position)
+        self.assertIsNone(position["net_pnl"])
         self.assertEqual(position["strategy_version"], strategy.VERSION)
         self.assertEqual(position["instrument_name"], "SILVERMIC")
         self.assertEqual(position["broker"], "DHAN")
@@ -276,6 +277,7 @@ class PaperStateTests(unittest.TestCase):
         paper_state.mark_position(self.trades, position, 100000, "2026-11-13 10:01:10")
         position = paper_state.create_state(self.trades)["position"]
         self.assertEqual(position["running_pnl"], 3000)
+        self.assertIsNone(position["net_pnl"])
         self.assertEqual(position["max_pnl_reached"], 3000)
         paper_state.mark_position(self.trades, position, 98000, "2026-11-13 10:01:20")
         position = paper_state.create_state(self.trades)["position"]

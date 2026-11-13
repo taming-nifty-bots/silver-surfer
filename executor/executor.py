@@ -193,7 +193,8 @@ def open_position(trades, state, signal, contract, quantity, quote, started_at, 
                     last_checked_asof=str(asof),
                     occupied_minutes=[str(received.floor("min"))],
                     profit_active=False, exit_requested=None, strategy_state="active", version=0,
-                    pnl=0.0, running_pnl=0.0, max_pnl_reached=0.0, min_pnl_reached=0.0,
+                    pnl=0.0, net_pnl=None, running_pnl=0.0,
+                    max_pnl_reached=0.0, min_pnl_reached=0.0,
                     last_mark=str(received), pnl_tracking_since=str(received),
                     charges=sum_charges(silver_micro_estimated_order_charges(
                         signal["side"], fill["price"], quantity)))
