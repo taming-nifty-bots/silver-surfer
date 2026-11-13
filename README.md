@@ -1,8 +1,9 @@
 # Silver Surfer
 
-**Implementation in progress. Do not deploy or trade from this repository yet.**
-Signal and paper executor jobs exist, but container deployment, end-to-end
-job startup and operational recovery still require validation. Live execution
+Two Azure jobs were started for a one-lot paper forward test on 2026-11-13.
+They run on weekdays from 08:58 IST, subject to the MCX calendar. Signal
+publication and executor startup were verified; a completed paper trade,
+scheduled restart and real-world recovery remain unverified. Live execution
 is deliberately disabled; setting `live_trading` to anything other than
 `false` stops the executor.
 
