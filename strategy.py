@@ -313,7 +313,7 @@ def recover_missed_exit(trade, candles, asof):
         raise ValueError("Invalid exit recovery interval")
     frame = frame.loc[(frame["datetime"] >= start) & (frame["datetime"] <= end)]
     frame = frame.sort_values("datetime")
-    active = recover_activation(trade, candles, start)
+    active = recover_activation(trade, candles, max(start, pd.Timestamp(trade["entry_timestamp"])))
     for stamp in frame["datetime"]:
         signal = build_signal(candles, stamp.date(), stamp + pd.Timedelta(minutes=1),
                               trade["session"])

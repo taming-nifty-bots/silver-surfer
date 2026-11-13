@@ -900,15 +900,22 @@ class ExecutorTests(unittest.TestCase):
         self.assertNotIn("profit_active", state["position"])
         self.assertEqual(state["position"]["last_checked_asof"], "2026-11-13 10:00:00")
         self.assertNotIn("exit_requested", state["position"])
-        self.now = datetime(2026, 11, 13, 10, 4, 2)
-        self.doc.update(data_asof="2026-11-13 10:03:00", brick_time="2026-11-13 10:03:00")
-        self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
-        with patch("strategy.recover_missed_exit",
-                   return_value=dict(reason="channel7", profit_active=True,
-                                     data_asof="2026-11-13 10:01:00")):
+        self.signals.docs.clear()
+        self.now = datetime(2026, 11, 13, 10, 4, 20)
+        candles = pd.DataFrame([dict(datetime="2026-11-13 10:01", close=100000),
+                                dict(datetime="2026-11-13 10:02", close=99000),
+                                dict(datetime="2026-11-13 10:03", close=99000)])
+
+        def rebuild(candles, day, now, session):
+            asof = pd.Timestamp(now).floor("min") - pd.Timedelta(minutes=1)
+            return dict(self.doc, data_asof=str(asof), candle_close=100000, close=97000)
+
+        with patch.object(self, "get_candles", return_value=candles), \
+                patch("strategy.build_signal", side_effect=rebuild):
             self.cycle()
         self.assertEqual(self.trades.find_one({"_id": "silver:2026-11-13:morning"})["exit_reason"],
                          "channel7")
+        self.assertTrue(any("Signal unavailable" in text for text in self.alerts))
 
 
 def calendar_checks():

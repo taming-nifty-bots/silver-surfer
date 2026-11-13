@@ -44,7 +44,8 @@ lock and independently rebuilt session signals. `executor/executor.py` handles q
 trades, recovery and configured quantity. Entry and exit are recorded in the
 same trade document. A failed channel-exit quote leaves the signal checkpoint
 unchanged so the exit can be reconstructed when fresh candles and signals are
-available. Forced exits retry without a signal.
+available. If the signal is unavailable, the executor alerts and reconstructs
+it from available candles instead. Forced exits retry without a signal.
 Paper BUYs use the best ask and SELLs the best bid, with no spread filter.
 Insufficient best-level size is recorded and alerted, but the full paper fill
 is optimistic. Request duration is checked; the REST response does not establish

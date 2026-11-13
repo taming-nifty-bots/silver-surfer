@@ -324,14 +324,22 @@ def run_cycle(trades, signals, calendars, quote_source, candles_source, clock, a
             if trade["exit_quote"]["insufficient_best_size"]:
                 alert("Best-level size was insufficient; full paper exit is optimistic")
             return
-        doc = checked_signal(signals, str(now.date()), position["session"], now)
+        candles = None
+        try:
+            doc = checked_signal(signals, str(now.date()), position["session"], now)
+        except ValueError as error:
+            alert(f"Signal unavailable ({error}); reconstructing it from observed candles.")
+            candles = candles_source(position)
+            doc = strategy.build_signal(candles, now.date(), now, position["session"])
+            doc["security_id"] = position["security_id"]
         if doc is None:
             return
         checked = pd.Timestamp(position["last_checked_asof"])
         asof = pd.Timestamp(doc["data_asof"])
         if asof <= checked:
             return
-        candles = candles_source(position)
+        if candles is None:
+            candles = candles_source(position)
         current = clock()
         if asof > checked + pd.Timedelta(minutes=1):
             alert(f"Position {position['_id']} missed signal checks after {checked}; "
