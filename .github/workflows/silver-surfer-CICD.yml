@@ -12,7 +12,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SILVER_IMAGE_NAME: silver-surfer:${{ github.run_number }}
+  EXECUTOR_IMAGE_NAME: silver-surfer:${{ github.run_number }}
+  SIGNAL_IMAGE_NAME: silver-surfer-signal:${{ github.run_number }}
   ACR_NAME: ${{ secrets.ACR_NAME }}
   RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
   PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/executor:${{ github.workspace }}/signal
@@ -57,11 +58,20 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Build shared Docker image
-        run: docker build -t "$ACR_NAME.azurecr.io/$SILVER_IMAGE_NAME" .
+      - name: Build Docker images
+        run: |
+          docker build -f executor/Dockerfile -t "$ACR_NAME.azurecr.io/$EXECUTOR_IMAGE_NAME" .
+          docker build -f signal/Dockerfile -t "$ACR_NAME.azurecr.io/$SIGNAL_IMAGE_NAME" .
 
-      - name: Push shared Docker image
-        run: docker push "$ACR_NAME.azurecr.io/$SILVER_IMAGE_NAME"
+      - name: Verify image imports
+        run: |
+          docker run --rm --entrypoint python "$ACR_NAME.azurecr.io/$EXECUTOR_IMAGE_NAME" -c "import executor, strategy"
+          docker run --rm --entrypoint python "$ACR_NAME.azurecr.io/$SIGNAL_IMAGE_NAME" -c "import signal_job, executor, strategy"
+
+      - name: Push Docker images
+        run: |
+          docker push "$ACR_NAME.azurecr.io/$EXECUTOR_IMAGE_NAME"
+          docker push "$ACR_NAME.azurecr.io/$SIGNAL_IMAGE_NAME"
 
       - name: Update all four job images without restarting
         uses: azure/CLI@v1
@@ -70,10 +80,17 @@ jobs:
             set -eu
             # Image-only updates preserve commands, environment and trigger/schedule settings.
             # Never start, stop or restart executions; stopped/manual jobs stay stopped.
-            for job in silver-surfer-morning-signal silver-surfer-morning-executor silver-surfer-signal silver-surfer-executor; do
+            for job in silver-surfer-morning-executor silver-surfer-executor; do
               az containerapp job update \
                 --name "$job" \
                 --resource-group "${{ secrets.RESOURCE_GROUP }}" \
-                --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SILVER_IMAGE_NAME }}" \
+                --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.EXECUTOR_IMAGE_NAME }}" \
+                --output none
+            done
+            for job in silver-surfer-morning-signal silver-surfer-signal; do
+              az containerapp job update \
+                --name "$job" \
+                --resource-group "${{ secrets.RESOURCE_GROUP }}" \
+                --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }}" \
                 --output none
             done

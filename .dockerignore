@@ -2,6 +2,8 @@
 !requirements.txt
 !strategy.py
 !signal/
+!signal/Dockerfile
 !signal/signal_job.py
 !executor/
+!executor/Dockerfile
 !executor/executor.py

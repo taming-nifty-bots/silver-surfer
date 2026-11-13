@@ -1,7 +1,8 @@
 # Silver Surfer
 
 The paper implementation uses separate morning and evening signal and executor
-jobs, with the same image and Mongo collections. Morning jobs start at 08:58 IST;
+jobs, with separate signal and executor images and shared Mongo collections.
+Morning jobs start at 08:58 IST;
 evening jobs start at 16:58 IST, subject to the MCX calendar. Morning entries
 end at 16:55, when any open morning position is force-exited. After a session's
 trade is closed, its jobs stop. If a morning position remains open
@@ -46,6 +47,9 @@ same trade document. A failed channel-exit quote leaves the signal checkpoint
 unchanged so the exit can be reconstructed when fresh candles and signals are
 available. If the signal is unavailable, the executor alerts and reconstructs
 it from available candles instead. Forced exits retry without a signal.
+Each job has its own Dockerfile. Both images include `strategy.py`; the signal
+image also includes `executor.py` because the signal job imports its trade-state
+and session helpers. Docker builds use the repository root as the build context.
 Paper BUYs use the best ask and SELLs the best bid, with no spread filter.
 Insufficient best-level size is recorded and alerted, but the full paper fill
 is optimistic. Request duration is checked; the REST response does not establish
