@@ -5,6 +5,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 from pymongo.errors import DuplicateKeyError
+from tamingnifty.charges import silver_micro_estimated_order_charges, sum_charges
 
 import paper_state
 
@@ -77,9 +78,9 @@ class PaperStateTests(unittest.TestCase):
         self.state = paper_state.create_state(self.states)
 
     def open(self, state=None, doc=None, start="2026-11-13 10:01:01",
-             end="2026-11-13 10:01:02"):
+             end="2026-11-13 10:01:02", quantity=1):
         return paper_state.open_position(self.states, state or self.state,
-                                         doc or signal(), contract(), quote(), start, end)
+                                         doc or signal(), contract(), quantity, quote(), start, end)
 
     def test_competing_entries_and_restart_preserve_one_position(self):
         position = self.open()
@@ -149,8 +150,31 @@ class PaperStateTests(unittest.TestCase):
             self.open(start="2026-11-13 10:01:01", end="2026-11-13 10:01:05")
         bad = dict(contract(), lot_size=2)
         with self.assertRaises(ValueError):
-            paper_state.open_position(self.states, self.state, signal(), bad, quote(),
+            paper_state.open_position(self.states, self.state, signal(), bad, 1, quote(),
                                       "2026-11-13 10:01:01", "2026-11-13 10:01:02")
+
+    def test_quantity_validation(self):
+        self.assertEqual(paper_state.validate_quantity("6", 3), 6)
+        for value in (None, "", "0", "-1", "1.5", "nan", True, "abc"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                paper_state.validate_quantity(value, 1)
+        with self.assertRaises(ValueError):
+            paper_state.validate_quantity(5, 3)
+
+    def test_multiple_lots_use_one_order_charge_per_side(self):
+        position = self.open(quantity=3)
+        self.assertEqual(position["quantity"], 3)
+        self.assertTrue(position["entry_quote"]["insufficient_best_size"])
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        trade = paper_state.close_position(self.states, state, "cutoff", quote(),
+                                           "2026-11-13 16:55:00", "2026-11-13 16:55:01")
+        charges = sum_charges(silver_micro_estimated_order_charges("BUY", 99000, 3),
+                              silver_micro_estimated_order_charges("SELL", 97000, 3))
+        self.assertEqual(trade["pnl"], -6000)
+        self.assertEqual(trade["charges"], charges)
+        self.assertEqual(charges["brokerage"], 40)
+        self.assertAlmostEqual(trade["net_pnl"], -6000 - charges["total"])
+        self.assertTrue(trade["exit_quote"]["insufficient_best_size"])
 
     def test_evening_quote_received_after_deadline_does_not_fill(self):
         evening = signal("evening", "2026-11-13 22:49:00")

@@ -1,6 +1,7 @@
 """Paper executor integration tests using in-memory Mongo stand-ins."""
 
 import unittest
+import os
 from datetime import datetime
 from unittest.mock import patch
 
@@ -36,7 +37,7 @@ class ExecutorTests(unittest.TestCase):
 
     def cycle(self):
         executor.run_cycle(self.states, self.trades, self.signals, None,
-                           self.get_quote, self.get_candles, self.clock, self.alerts.append)
+                           self.get_quote, self.get_candles, self.clock, self.alerts.append, 1)
 
     def test_paper_entry_activation_exit_and_archive(self):
         with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
@@ -56,6 +57,32 @@ class ExecutorTests(unittest.TestCase):
             self.cycle()
         self.assertIsNone(self.states.find_one({"_id": paper_state.STATE_ID})["pending_trade"])
         self.assertEqual(len(self.trades.docs), 1)
+
+    def test_configured_quantity_and_existing_position_recovery(self):
+        with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
+            executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
+                               self.get_candles, self.clock, self.alerts.append, 3)
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertEqual(state["position"]["quantity"], 3)
+        self.assertTrue(any("Qty 3" in text for text in self.alerts))
+        self.now = datetime(2026, 11, 13, 16, 55)
+        self.cycle()
+        trade = self.states.find_one({"_id": paper_state.STATE_ID})["pending_trade"]
+        self.assertEqual(trade["quantity"], 3)
+        self.assertEqual(trade["pnl"], -6000)
+
+    def test_missing_and_invalid_quantity_rejected_at_startup(self):
+        environment = dict(CONNECTION_STRING="offline", user_name="test", slack_token="offline",
+                           DHAN_CLIENT_ID="offline", DHAN_PIN="offline", DHAN_TOTP="offline",
+                           SILVER_SESSION="morning", live_trading="false")
+        for quantity in (None, "0", "1.5"):
+            values = dict(environment)
+            if quantity is not None:
+                values["quantity"] = quantity
+            with self.subTest(quantity=quantity), patch.dict(os.environ, values, clear=True), \
+                    patch("executor.load_dotenv"), patch("executor.find_dotenv", return_value=""), \
+                    self.assertRaises(ValueError):
+                executor.main()
 
     def test_cutoff_exit_without_calendar_or_signal(self):
         with patch("executor.market.session_status", return_value=dict(morning=True, evening=True)):
@@ -145,12 +172,12 @@ class ExecutorTests(unittest.TestCase):
         start = datetime(2026, 11, 13, 16, 58)
         self.now = datetime(2026, 11, 13, 17, 0, 59)
         executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
-                           self.get_candles, self.clock, self.alerts.append,
+                           self.get_candles, self.clock, self.alerts.append, 1,
                            session="evening", started_at=start)
         self.assertIsNotNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
         self.now = datetime(2026, 11, 13, 17, 1)
         executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
-                           self.get_candles, self.clock, self.alerts.append,
+                           self.get_candles, self.clock, self.alerts.append, 1,
                            session="evening", started_at=start)
         state = self.states.find_one({"_id": paper_state.STATE_ID})
         self.assertIsNone(state["position"])
@@ -162,12 +189,12 @@ class ExecutorTests(unittest.TestCase):
         start = datetime(2026, 11, 13, 18, 30)
         self.now = datetime(2026, 11, 13, 18, 30, 59)
         executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
-                           self.get_candles, self.clock, self.alerts.append,
+                           self.get_candles, self.clock, self.alerts.append, 1,
                            session="evening", started_at=start)
         self.assertIsNotNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
         self.now = datetime(2026, 11, 13, 18, 31)
         executor.run_cycle(self.states, self.trades, self.signals, None, self.get_quote,
-                           self.get_candles, self.clock, self.alerts.append,
+                           self.get_candles, self.clock, self.alerts.append, 1,
                            session="evening", started_at=start)
         self.assertIsNone(self.states.find_one({"_id": paper_state.STATE_ID})["position"])
 

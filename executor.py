@@ -60,7 +60,7 @@ def session_finished(state, session, now):
     return now.time() >= clock_time(16, 55) and now.time() < clock_time(23)
 
 
-def run_cycle(states, trades, signals, calendars, quote_source, candles_source, clock, alert,
+def run_cycle(states, trades, signals, calendars, quote_source, candles_source, clock, alert, quantity,
               session=None, started_at=None):
     state = paper_state.create_state(states)
     if state["pending_trade"] is not None:
@@ -159,9 +159,11 @@ def run_cycle(states, trades, signals, calendars, quote_source, candles_source, 
     side = decisions.entry_decision(doc, now, status[session])
     if side is None:
         return
+    paper_state.validate_quantity(quantity, doc["contract"]["lot_size"])
     quote, started, received = quote_source(doc["security_id"])
-    position = paper_state.open_position(states, state, doc, doc["contract"], quote, started, received)
-    alert(f"Entry {position['id']} {side} at {position['entry_price']}; "
+    position = paper_state.open_position(states, state, doc, doc["contract"], quantity,
+                                         quote, started, received)
+    alert(f"Entry {position['id']} {side} Qty {position['quantity']} at {position['entry_price']}; "
           f"spread {position['entry_quote']['spread']}")
     if position["entry_quote"]["insufficient_best_size"]:
         alert("Best-level size was insufficient; full paper fill is optimistic")
@@ -179,6 +181,10 @@ def main():
     session = os.environ.get("SILVER_SESSION", "").strip().lower()
     if session not in ("morning", "evening"):
         raise ValueError("SILVER_SESSION must be morning or evening")
+    quantity = os.environ.get("quantity")
+    if quantity is None:
+        raise ValueError("Missing quantity; configure the executor job explicitly")
+    quantity = paper_state.validate_quantity(quantity, 1)
     slack = WebClient(token=os.environ["slack_token"])
     client = MongoClient(os.environ["CONNECTION_STRING"])
     db = client["Bots"]
@@ -204,7 +210,7 @@ def main():
     def alert(message):
         notify(slack, message)
 
-    notify(slack, f"Started {session} in one-lot paper mode; live orders disabled")
+    notify(slack, f"Started {session} in paper mode; Qty {quantity}; live orders disabled")
     started_at = now_ist()
     waiting_alert = False
     last_error = None
@@ -219,7 +225,7 @@ def main():
                         and state["position"]["session"] == "morning" and not waiting_alert):
                     alert("Earlier morning position remains open; waiting one minute before recovery.")
                     waiting_alert = True
-                run_cycle(states, trades, signals, calendars, quote_source, candles_source, now_ist, alert,
+                run_cycle(states, trades, signals, calendars, quote_source, candles_source, now_ist, alert, quantity,
                           session=session, started_at=started_at)
                 if last_error is not None:
                     alert("Executor recovered")

@@ -47,7 +47,22 @@ def priced_quote(quote, side, quantity, started_at, received_at):
     return fill
 
 
-def open_position(states, state, signal, contract, quote, started_at, received_at):
+def validate_quantity(quantity, lot_size):
+    if isinstance(quantity, bool) or isinstance(lot_size, bool):
+        raise ValueError("quantity and lot size must be positive whole numbers")
+    try:
+        qty = int(quantity)
+        lot = int(lot_size)
+        if qty != float(quantity) or lot != float(lot_size):
+            raise ValueError("quantity and lot size must be positive whole numbers")
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("quantity and lot size must be positive whole numbers")
+    if qty <= 0 or lot <= 0 or qty % lot:
+        raise ValueError(f"quantity must be a positive multiple of contract lot size {lot}")
+    return qty
+
+
+def open_position(states, state, signal, contract, quantity, quote, started_at, received_at):
     received = valid_time(received_at)
     asof = valid_time(signal["data_asof"])
     if received.floor("min") != asof + timedelta(minutes=1):
@@ -62,9 +77,9 @@ def open_position(states, state, signal, contract, quote, started_at, received_a
         raise ValueError("Paper entry does not meet the signal rules")
     if str(signal["security_id"]) != str(contract["security_id"]):
         raise ValueError("Signal and paper contract differ")
-    quantity = contract["lot_size"]
-    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity != 1:
-        raise ValueError("Paper accounting currently requires a one-unit Silver Micro lot")
+    if contract["lot_size"] != 1:
+        raise ValueError("Silver Micro paper accounting requires a one-unit contract lot size")
+    quantity = validate_quantity(quantity, contract["lot_size"])
     day = str(received.date())
     if state["slot_day"] is not None and state["slot_day"] > day:
         raise ValueError("Paper state is dated after the entry")
@@ -157,8 +172,8 @@ def close_position(states, state, reason, quote, started_at, received_at):
     direction = 1 if position["side"] == "BUY" else -1
     pnl = money(direction * (fill["price"] - position["entry_price"]) * position["quantity"])
     charges = sum_charges(
-        silver_micro_estimated_order_charges(position["side"], position["entry_price"], 1),
-        silver_micro_estimated_order_charges(side, fill["price"], 1))
+        silver_micro_estimated_order_charges(position["side"], position["entry_price"], position["quantity"]),
+        silver_micro_estimated_order_charges(side, fill["price"], position["quantity"]))
     trade = dict(position, _id=position["id"], exit_price=fill["price"],
                  exit_timestamp=str(received), exit_quote=fill, exit_reason=reason,
                  pnl=pnl, charges=charges, net_pnl=money(pnl - charges["total"]))

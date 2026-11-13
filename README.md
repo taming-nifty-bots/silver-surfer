@@ -15,6 +15,12 @@ single-day deployment; a completed paper trade, scheduled restart and
 real-world recovery remain unverified. Live execution
 is deliberately disabled; setting `live_trading` to anything other than
 `false` stops the executor.
+Each executor requires the `quantity` environment variable, a positive whole
+number of contract units and a multiple of the Dhan lot size. Set it to `1`
+for the current one-lot forward test. A position retains its entry quantity
+for exit and accounting even if the configured quantity later changes.
+Paper accounting currently requires the Silver Micro contract lot size to be
+one unit and rejects an unexpected contract lot size.
 At each minute boundary, the executor allows up to 15 seconds for a fresh
 signal before raising an error; fresh signals and forced exits are not delayed.
 
