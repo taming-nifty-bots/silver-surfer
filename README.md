@@ -50,6 +50,11 @@ it from available candles instead. Forced exits retry without a signal.
 Each job has its own Dockerfile. Both images include `strategy.py`; the signal
 image also includes `executor.py` because the signal job imports its trade-state
 and session helpers. Docker builds use the repository root as the build context.
+After tests pass on `main`, the pipeline deploys and restarts each running
+signal job before deploying and restarting each running executor job. Stopped
+jobs remain stopped. The pipeline waits for restarted executions to reach
+Running; this does not prove that the signal has published a fresh candle or
+that an executor has recovered its position.
 Paper BUYs use the best ask and SELLs the best bid, with no spread filter.
 Insufficient best-level size is recorded and alerted, but the full paper fill
 is optimistic. Request duration is checked; the REST response does not establish

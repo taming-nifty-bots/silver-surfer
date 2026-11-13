@@ -73,24 +73,114 @@ jobs:
           docker push "$ACR_NAME.azurecr.io/$EXECUTOR_IMAGE_NAME"
           docker push "$ACR_NAME.azurecr.io/$SIGNAL_IMAGE_NAME"
 
-      - name: Update all four job images without restarting
+      - name: Deploy morning signal
         uses: azure/CLI@v1
         with:
           inlineScript: |
             set -eu
-            # Image-only updates preserve commands, environment and trigger/schedule settings.
-            # Never start, stop or restart executions; stopped/manual jobs stay stopped.
-            for job in silver-surfer-morning-executor silver-surfer-executor; do
-              az containerapp job update \
-                --name "$job" \
-                --resource-group "${{ secrets.RESOURCE_GROUP }}" \
-                --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.EXECUTOR_IMAGE_NAME }}" \
-                --output none
-            done
-            for job in silver-surfer-morning-signal silver-surfer-signal; do
-              az containerapp job update \
-                --name "$job" \
-                --resource-group "${{ secrets.RESOURCE_GROUP }}" \
-                --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }}" \
-                --output none
-            done
+            az containerapp job update \
+              --name silver-surfer-morning-signal \
+              --resource-group "${{ secrets.RESOURCE_GROUP }}" \
+              --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }}" \
+              --output none
+
+      - name: Restart running morning signal
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            set -eu
+            running=$(az containerapp job execution list -n silver-surfer-morning-signal -g "${{ secrets.RESOURCE_GROUP }}" --query "[?properties.status=='Running'].name" -o tsv)
+            if [ -n "$running" ]; then
+              az containerapp job stop -n silver-surfer-morning-signal -g "${{ secrets.RESOURCE_GROUP }}"
+              execution=$(az containerapp job start -n silver-surfer-morning-signal -g "${{ secrets.RESOURCE_GROUP }}" --query name -o tsv)
+              for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                status=$(az containerapp job execution show -n silver-surfer-morning-signal -g "${{ secrets.RESOURCE_GROUP }}" --job-execution-name "$execution" --query properties.status -o tsv)
+                if [ "$status" = "Running" ]; then break; fi
+                sleep 5
+              done
+              if [ "$status" != "Running" ]; then echo "Morning signal did not start: $status" >&2; exit 1; fi
+            fi
+
+      - name: Deploy evening signal
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            set -eu
+            az containerapp job update \
+              --name silver-surfer-signal \
+              --resource-group "${{ secrets.RESOURCE_GROUP }}" \
+              --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.SIGNAL_IMAGE_NAME }}" \
+              --output none
+
+      - name: Restart running evening signal
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            set -eu
+            running=$(az containerapp job execution list -n silver-surfer-signal -g "${{ secrets.RESOURCE_GROUP }}" --query "[?properties.status=='Running'].name" -o tsv)
+            if [ -n "$running" ]; then
+              az containerapp job stop -n silver-surfer-signal -g "${{ secrets.RESOURCE_GROUP }}"
+              execution=$(az containerapp job start -n silver-surfer-signal -g "${{ secrets.RESOURCE_GROUP }}" --query name -o tsv)
+              for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                status=$(az containerapp job execution show -n silver-surfer-signal -g "${{ secrets.RESOURCE_GROUP }}" --job-execution-name "$execution" --query properties.status -o tsv)
+                if [ "$status" = "Running" ]; then break; fi
+                sleep 5
+              done
+              if [ "$status" != "Running" ]; then echo "Evening signal did not start: $status" >&2; exit 1; fi
+            fi
+
+      - name: Deploy morning executor
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            set -eu
+            az containerapp job update \
+              --name silver-surfer-morning-executor \
+              --resource-group "${{ secrets.RESOURCE_GROUP }}" \
+              --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.EXECUTOR_IMAGE_NAME }}" \
+              --output none
+
+      - name: Restart running morning executor
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            set -eu
+            running=$(az containerapp job execution list -n silver-surfer-morning-executor -g "${{ secrets.RESOURCE_GROUP }}" --query "[?properties.status=='Running'].name" -o tsv)
+            if [ -n "$running" ]; then
+              az containerapp job stop -n silver-surfer-morning-executor -g "${{ secrets.RESOURCE_GROUP }}"
+              execution=$(az containerapp job start -n silver-surfer-morning-executor -g "${{ secrets.RESOURCE_GROUP }}" --query name -o tsv)
+              for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                status=$(az containerapp job execution show -n silver-surfer-morning-executor -g "${{ secrets.RESOURCE_GROUP }}" --job-execution-name "$execution" --query properties.status -o tsv)
+                if [ "$status" = "Running" ]; then break; fi
+                sleep 5
+              done
+              if [ "$status" != "Running" ]; then echo "Morning executor did not start: $status" >&2; exit 1; fi
+            fi
+
+      - name: Deploy evening executor
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            set -eu
+            az containerapp job update \
+              --name silver-surfer-executor \
+              --resource-group "${{ secrets.RESOURCE_GROUP }}" \
+              --image "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.EXECUTOR_IMAGE_NAME }}" \
+              --output none
+
+      - name: Restart running evening executor
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            set -eu
+            running=$(az containerapp job execution list -n silver-surfer-executor -g "${{ secrets.RESOURCE_GROUP }}" --query "[?properties.status=='Running'].name" -o tsv)
+            if [ -n "$running" ]; then
+              az containerapp job stop -n silver-surfer-executor -g "${{ secrets.RESOURCE_GROUP }}"
+              execution=$(az containerapp job start -n silver-surfer-executor -g "${{ secrets.RESOURCE_GROUP }}" --query name -o tsv)
+              for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                status=$(az containerapp job execution show -n silver-surfer-executor -g "${{ secrets.RESOURCE_GROUP }}" --job-execution-name "$execution" --query properties.status -o tsv)
+                if [ "$status" = "Running" ]; then break; fi
+                sleep 5
+              done
+              if [ "$status" != "Running" ]; then echo "Evening executor did not start: $status" >&2; exit 1; fi
+            fi
