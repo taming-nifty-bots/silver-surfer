@@ -26,6 +26,10 @@ signal before raising an error; fresh signals and forced exits are not delayed.
 Daily contract and session signals reuse fixed document IDs in
 `Bots.supertrend`, alongside Interceptor's signals. Open and closed paper
 trades use `Bots.silver_surfer_<user>`; this collection contains only trades.
+Trade documents follow Interceptor's common identifiers, strategy, broker,
+simulation, quantity, signal and date/time fields. Silver keeps `side`,
+`entry_price` and `exit_price` for futures and retains its paper quote and
+recovery details; option-specific fields do not apply.
 The MCX calendar remains shared in `Bots.exchange_calendars`.
 
 `strategy.py` contains the calendar, contract selection, Renko rules, signal

@@ -180,12 +180,17 @@ def open_position(trades, state, signal, contract, quantity, quote, started_at, 
     if state["last_exit_minute"] == str(received.floor("min")):
         raise ValueError("A position closed during this minute")
     fill = priced_quote(quote, signal["side"], quantity, started_at, received_at)
-    position = dict(_id=f"silver:{day}:{signal['session']}", session=signal["session"],
+    position = dict(_id=f"silver:{day}:{signal['session']}",
+                    strategy_version=strategy.VERSION, instrument_name="SILVERMIC",
+                    broker="DHAN", simulated=True, session=signal["session"],
                     side=signal["side"], security_id=str(contract["security_id"]),
                     symbol=contract["symbol"], expiry=contract["expiry"],
-                    quantity=quantity, entry_price=fill["price"],
+                    lot_size=contract["lot_size"], quantity=quantity, requested_quantity=quantity,
+                    entry_price=fill["price"], entry_date=day,
+                    entry_time=received.strftime("%H:%M:%S"),
                     entry_timestamp=str(received), entry_quote=fill,
-                    entry_signal_asof=str(asof), last_checked_asof=str(asof),
+                    entry_signal=str(asof), signal_doc_id=f"silver:{signal['session']}",
+                    last_checked_asof=str(asof),
                     occupied_minutes=[str(received.floor("min"))],
                     profit_active=False, exit_requested=None, strategy_state="active", version=0)
     try:
@@ -269,6 +274,7 @@ def close_position(trades, state, reason, quote, started_at, received_at):
         silver_micro_estimated_order_charges(side, fill["price"], position["quantity"]))
     trade = dict(position, strategy_state="closed", version=position["version"] + 1,
                  exit_price=fill["price"],
+                 exit_date=str(received.date()), exit_time=received.strftime("%H:%M:%S"),
                  exit_timestamp=str(received), exit_quote=fill, exit_reason=reason,
                  occupied_minutes=position["occupied_minutes"] + [str(received.floor("min"))],
                  pnl=pnl, charges=charges, net_pnl=money(pnl - charges["total"]))
