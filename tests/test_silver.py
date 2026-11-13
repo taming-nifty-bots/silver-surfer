@@ -101,6 +101,12 @@ class Collection:
                         updated[key] = deepcopy(value)
                     for key, value in changes.get("$inc", {}).items():
                         updated[key] += value
+                    for key, value in changes.get("$max", {}).items():
+                        if key not in updated or value > updated[key]:
+                            updated[key] = value
+                    for key, value in changes.get("$min", {}).items():
+                        if key not in updated or value < updated[key]:
+                            updated[key] = value
                     for key in changes.get("$unset", {}):
                         updated.pop(key, None)
                     self.check_indexes(updated, exclude=doc["_id"])
@@ -264,6 +270,41 @@ class PaperStateTests(unittest.TestCase):
         self.assertEqual(trade["pnl"], -6000)
         self.assertEqual(trade["charges"], charges)
         self.assertAlmostEqual(trade["net_pnl"], -6000 - charges["total"])
+
+    def test_running_pnl_marks_long_and_short_and_closes(self):
+        position = self.open(quantity=3)
+        paper_state.mark_position(self.trades, position, 100000, "2026-11-13 10:01:10")
+        position = paper_state.create_state(self.trades)["position"]
+        self.assertEqual(position["running_pnl"], 3000)
+        self.assertEqual(position["max_pnl_reached"], 3000)
+        paper_state.mark_position(self.trades, position, 98000, "2026-11-13 10:01:20")
+        position = paper_state.create_state(self.trades)["position"]
+        self.assertEqual((position["running_pnl"], position["min_pnl_reached"]), (-3000, -3000))
+        trade = self.close()
+        self.assertEqual(trade["running_pnl"], trade["pnl"])
+        self.assertEqual(trade["min_pnl_reached"], -6000)
+
+        other = Collection()
+        paper_state.initialize_store(other)
+        short = paper_state.open_position(other, paper_state.create_state(other),
+                                          signal(side="SELL"), contract(), 3, quote(),
+                                          "2026-11-13 10:01:01", "2026-11-13 10:01:02")
+        paper_state.mark_position(other, short, 96000, "2026-11-13 10:01:10")
+        marked = paper_state.create_state(other)["position"]
+        self.assertEqual((marked["running_pnl"], marked["max_pnl_reached"]), (3000, 3000))
+        with self.assertRaises(RuntimeError):
+            paper_state.mark_position(other, short, 96000, "2026-11-13 10:01:11")
+
+    def test_legacy_trade_starts_tracking_only_when_first_marked(self):
+        position = self.open()
+        for key in ("running_pnl", "max_pnl_reached", "min_pnl_reached", "pnl_tracking_since"):
+            del self.trades.docs[position["_id"]][key]
+        position = paper_state.create_state(self.trades)["position"]
+        paper_state.mark_position(self.trades, position, 100000, "2026-11-13 10:01:10")
+        position = paper_state.create_state(self.trades)["position"]
+        self.assertEqual(position["pnl_tracking_since"], "2026-11-13 10:01:10")
+        self.assertEqual(position["max_pnl_reached"], 1000)
+        self.assertEqual(position["min_pnl_reached"], 1000)
 
     def test_threads_competing_for_different_sessions_have_one_winner(self):
         def enter(session):
@@ -656,6 +697,7 @@ class ExecutorTests(unittest.TestCase):
                 patch.object(executor, "now_ist", side_effect=self.clock), \
                 patch.object(executor.time, "sleep", side_effect=reach_cutoff), \
                 patch.object(executor.dhan, "login_to_dhan"), \
+                patch.object(executor.dhan, "get_commodity_ltp", return_value=99000), \
                 patch.object(executor.dhan, "get_depth", side_effect=[quote(), quote()]) as depth, \
                 patch.object(strategy, "session_status", return_value=dict(morning=True, evening=True)):
             executor.main()

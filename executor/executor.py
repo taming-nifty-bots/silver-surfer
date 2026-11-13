@@ -192,12 +192,36 @@ def open_position(trades, state, signal, contract, quantity, quote, started_at, 
                     entry_signal=str(asof), signal_doc_id=f"silver:{signal['session']}",
                     last_checked_asof=str(asof),
                     occupied_minutes=[str(received.floor("min"))],
-                    profit_active=False, exit_requested=None, strategy_state="active", version=0)
+                    profit_active=False, exit_requested=None, strategy_state="active", version=0,
+                    pnl=0.0, running_pnl=0.0, max_pnl_reached=0.0, min_pnl_reached=0.0,
+                    last_mark=str(received), pnl_tracking_since=str(received),
+                    charges=sum_charges(silver_micro_estimated_order_charges(
+                        signal["side"], fill["price"], quantity)))
     try:
         trades.insert_one(position.copy())
     except DuplicateKeyError as error:
         raise RuntimeError("Paper entry conflicts with an active trade or used session; no fill recorded") from error
     return position
+
+
+def mark_position(trades, position, price, marked_at):
+    price = float(price)
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("Invalid commodity LTP for running P&L")
+    marked = valid_time(marked_at)
+    if marked < valid_time(position["entry_timestamp"]):
+        raise ValueError("P&L mark precedes entry")
+    direction = 1 if position["side"] == "BUY" else -1
+    gross = money(direction * (price - position["entry_price"]) * position["quantity"])
+    values = {"running_pnl": gross, "last_mark": str(marked)}
+    if "pnl_tracking_since" not in position:
+        values["pnl_tracking_since"] = str(marked)
+    result = trades.update_one(
+        {"_id": position["_id"], "version": position["version"], "strategy_state": "active"},
+        {"$set": values, "$max": {"max_pnl_reached": gross},
+         "$min": {"min_pnl_reached": gross}, "$inc": {"version": 1}})
+    if result.modified_count != 1:
+        raise RuntimeError("Paper P&L mark lost a concurrent trade update")
 
 
 def update_activation(trades, state, active):
@@ -277,7 +301,10 @@ def close_position(trades, state, reason, quote, started_at, received_at):
                  exit_date=str(received.date()), exit_time=received.strftime("%H:%M:%S"),
                  exit_timestamp=str(received), exit_quote=fill, exit_reason=reason,
                  occupied_minutes=position["occupied_minutes"] + [str(received.floor("min"))],
-                 pnl=pnl, charges=charges, net_pnl=money(pnl - charges["total"]))
+                 pnl=pnl, running_pnl=pnl, last_mark=str(received),
+                 max_pnl_reached=max(position.get("max_pnl_reached", pnl), pnl),
+                 min_pnl_reached=min(position.get("min_pnl_reached", pnl), pnl),
+                 charges=charges, net_pnl=money(pnl - charges["total"]))
     trade.pop("id", None)
     values = dict(trade)
     del values["_id"]
@@ -463,6 +490,11 @@ def main():
             hour=0, minute=0, second=0, microsecond=0) - timedelta(days=21)
         return dhan.fetch_candles(conn, position["security_id"], "MCX_COMM", "FUTCOM", start, now)
 
+    def mark_source(security_id):
+        conn = dhan.login_to_dhan(slack_channel=os.environ.get("SLACK_CHANNEL", "silver-surfer"))
+        price = dhan.get_commodity_ltp(conn, security_id)
+        return price, now_ist()
+
     def alert(message):
         notify(slack, message)
 
@@ -488,6 +520,9 @@ def main():
                     alert("Executor recovered")
                     last_error = None
                 state = create_state(trades)
+                if state["position"] is not None:
+                    price, marked_at = mark_source(state["position"]["security_id"])
+                    mark_position(trades, state["position"], price, marked_at)
                 if session_finished(state, session, now_ist()):
                     break
                 if (state["position"] is None

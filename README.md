@@ -30,6 +30,11 @@ Trade documents follow Interceptor's common identifiers, strategy, broker,
 simulation, quantity, signal and date/time fields. Silver keeps `side`,
 `entry_price` and `exit_price` for futures and retains its paper quote and
 recovery details; option-specific fields do not apply.
+While a trade is open, `running_pnl`, `max_pnl_reached` and `min_pnl_reached`
+are gross estimates based on commodity LTP, not executable bid/ask or net
+P&L. `last_mark` records the mark time. `pnl_tracking_since` identifies when
+extrema tracking began; older untracked periods cannot be reconstructed.
+On closure `pnl` is gross and `net_pnl` deducts estimated itemized charges.
 The MCX calendar remains shared in `Bots.exchange_calendars`.
 
 `strategy.py` contains the calendar, contract selection, Renko rules, signal
