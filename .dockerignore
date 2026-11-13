@@ -1,0 +1,11 @@
+*
+!requirements.txt
+!strategy.py
+!signals.py
+!decisions.py
+!market.py
+!paper.py
+!paper_state.py
+!publisher.py
+!signal_job.py
+!executor.py
