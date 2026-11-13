@@ -7,14 +7,13 @@ from zoneinfo import ZoneInfo
 
 from dotenv import find_dotenv, load_dotenv
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+import pandas as pd
 from slack_sdk import WebClient
 from tamingnifty import connect_dhan as dhan
 from tamingnifty import utils
 
-import market
 import executor
-import paper_state
-import publisher
 import strategy
 
 
@@ -31,6 +30,69 @@ def notify(slack, message):
         print("Slack notification failed: " + utils.exception_detail(error), flush=True)
 
 
+def lock_contract(signals, day, candidate):
+    key = "silver:contract"
+    day = str(day)
+    document = signals.find_one({"_id": key})
+    if document is None:
+        document = dict(_id=key, day=day, strategy_version=strategy.VERSION, contract=candidate)
+        try:
+            signals.insert_one(document)
+        except DuplicateKeyError:
+            document = signals.find_one({"_id": key})
+    if document is not None and document["day"] < day:
+        updated = dict(_id=key, day=day, strategy_version=strategy.VERSION, contract=candidate)
+        result = signals.replace_one({"_id": key, "day": document["day"]}, updated)
+        if result.modified_count != 1:
+            raise RuntimeError("Concurrent Silver contract lock update; retry")
+        document = updated
+    if document is not None and document["day"] != day:
+        raise ValueError("Silver contract lock is from a later day")
+    if document is None or document.get("strategy_version") != strategy.VERSION:
+        raise ValueError("Missing or incompatible Silver contract lock")
+    if not isinstance(document.get("contract"), dict):
+        raise ValueError("Invalid Silver contract lock")
+    return document["contract"]
+
+
+def prepare_signal(candles, day, now, session, status, contract, position):
+    if not status[session]:
+        raise ValueError("MCX session is closed")
+    if position is not None and (str(position["security_id"]) != str(contract["security_id"])
+                                 or position["expiry"] != contract["expiry"]):
+        raise ValueError("Open paper position does not match the locked contract")
+    doc = strategy.build_signal(candles, day, now, session)
+    doc.update(_id=f"silver:{session}", strategy_version=strategy.VERSION,
+               security_id=str(contract["security_id"]), expiry=contract["expiry"],
+               contract=contract, updated_at=str(pd.Timestamp(now)))
+    doc["missing_minutes"] = strategy.session_gaps(
+        candles, day, doc["data_asof"], status["morning"], status["evening"])
+    return doc
+
+
+def publish(collection, doc):
+    existing = collection.find_one({"_id": doc["_id"]})
+    if existing is None:
+        try:
+            collection.insert_one(doc.copy())
+            return True
+        except DuplicateKeyError:
+            raise RuntimeError("Concurrent Silver signal publication; retry")
+    old = pd.Timestamp(existing["data_asof"])
+    new = pd.Timestamp(doc["data_asof"])
+    if old.date() == new.date() and (
+            existing.get("strategy_version") != doc["strategy_version"]
+            or existing.get("security_id") != doc["security_id"]
+            or existing.get("expiry") != doc["expiry"]):
+        raise ValueError("Existing signal conflicts with the daily contract lock")
+    if new <= old:
+        return False
+    result = collection.replace_one({"_id": doc["_id"], "data_asof": existing["data_asof"]}, doc)
+    if result.modified_count != 1:
+        raise RuntimeError("Concurrent Silver signal update; retry")
+    return True
+
+
 def main():
     load_dotenv(find_dotenv())
     for key in ("CONNECTION_STRING", "user_name", "slack_token", "DHAN_CLIENT_ID",
@@ -45,7 +107,6 @@ def main():
     db = client["Bots"]
     user = os.environ["user_name"]
     signals = db["supertrend"]
-    locks = signals
     states = db[f"silver_surfer_{user}"]
     calendars = db["exchange_calendars"]
     last_minute = None
@@ -57,28 +118,28 @@ def main():
         while True:
             now = now_ist()
             try:
-                state = states.find_one({"_id": paper_state.STATE_ID})
+                state = executor.create_state(states)
                 if executor.session_finished(state, session, now):
                     break
                 if session == "morning" and now.time() >= clock_time(16, 55):
                     break
                 if session == "evening" and now.time() >= strategy.EVENING_EXIT:
                     break
-                status = market.session_status(calendars, now.date())
+                status = strategy.session_status(calendars, now.date())
                 if not status[session]:
                     break
                 minute = now.replace(second=0, microsecond=0)
                 active = (clock_time(9) <= now.time() < clock_time(16, 55)
                           if session == "morning" else clock_time(17) <= now.time() < strategy.EVENING_EXIT)
                 if active and status[session] and minute != last_minute:
-                    lock = locks.find_one({"_id": "silver:" + str(now.date())})
-                    if lock is None:
-                        candidate = market.silver_contract(dhan.load_instruments(), calendars, now.date())
+                    lock = signals.find_one({"_id": "silver:contract"})
+                    if lock is None or lock.get("day") != str(now.date()):
+                        candidate = strategy.silver_contract(dhan.load_instruments(), calendars, now.date())
                     else:
                         candidate = lock["contract"]
-                    contract = publisher.lock_contract(locks, now.date(), candidate)
-                    state = states.find_one({"_id": paper_state.STATE_ID})
-                    position = None if state is None else state["position"]
+                    contract = lock_contract(signals, now.date(), candidate)
+                    state = executor.create_state(states)
+                    position = state["position"]
                     if position is not None and (str(position["security_id"]) != contract["security_id"]
                                                  or position["expiry"] != contract["expiry"]):
                         raise ValueError("An open paper position has a different contract")
@@ -89,9 +150,9 @@ def main():
                     published_at = now_ist()
                     if published_at.date() != now.date():
                         raise ValueError("Date changed while fetching Silver candles")
-                    doc = publisher.prepare_signal(candles, now.date(), published_at, session,
+                    doc = prepare_signal(candles, now.date(), published_at, session,
                                                    status, contract, position)
-                    if publisher.publish(signals, doc):
+                    if publish(signals, doc):
                         gaps = doc["missing_minutes"]
                         if gaps and gaps != previous_gaps:
                             notify(slack, f"Missing {len(gaps)} expected candles; latest {gaps[-1]}. "

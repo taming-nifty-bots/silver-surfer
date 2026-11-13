@@ -4,7 +4,7 @@ The paper implementation uses separate morning and evening signal and executor
 jobs, with the same image and Mongo collections. Morning jobs start at 08:58 IST;
 evening jobs start at 16:58 IST, subject to the MCX calendar. Morning entries
 end at 16:55, when any open morning position is force-exited. After a session's
-trade is closed and archived, its jobs stop. If a morning position remains open
+trade is closed, its jobs stop. If a morning position remains open
 at 17:00, the evening executor waits one minute and then retries its exit.
 Evening entries are permitted no later than 22:50:00 IST; any open evening
 position is force-exited starting at 23:10 IST. Quote or service failures
@@ -23,23 +23,22 @@ Paper accounting currently requires the Silver Micro contract lot size to be
 one unit and rejects an unexpected contract lot size.
 At each minute boundary, the executor allows up to 15 seconds for a fresh
 signal before raising an error; fresh signals and forced exits are not delayed.
-Daily contract locks and session signals use `Bots.supertrend`, alongside
-Interceptor's signals with separate document IDs. Paper state and closed
-trades use `Bots.silver_surfer_<user>`. The MCX calendar remains shared in
-`Bots.exchange_calendars`.
+Daily contract and session signals reuse fixed document IDs in
+`Bots.supertrend`, alongside Interceptor's signals. Open and closed paper
+trades use `Bots.silver_surfer_<user>`; this collection contains only trades.
+The MCX calendar remains shared in `Bots.exchange_calendars`.
 
-`strategy.py` contains the selected Renko breakout and channel rules.
-`signals.py` builds levels from completed candles and identifies missing
-regular-session minutes. `signal_job.py` publishes independently rebuilt
-session signals, and `executor.py` consumes them for one-lot paper execution.
-`paper_state.py` uses atomic state updates, records an exit intent before
-requesting a quote, and recovers a closed trade if interrupted during archive.
+`strategy.py` contains the calendar, contract selection, Renko rules, signal
+construction and recovery helpers. `signal/signal_job.py` publishes the contract
+lock and independently rebuilt session signals. `executor/executor.py` handles quotes, paper
+trades, recovery and configured quantity. Entry and exit are recorded in the
+same trade document, with an exit intent saved before requesting a quote.
 Paper BUYs use the best ask and SELLs the best bid, with no spread filter.
 Insufficient best-level size is recorded and alerted, but the full paper fill
 is optimistic. Request duration is checked; the REST response does not establish
 an independent exchange order-book timestamp.
-`market.py` reads the `MCX:YYYY` calendar and chooses the Silver Micro
-contract. The rollover implementation counts trading dates from the current
+The `MCX:YYYY` calendar is used to choose the Silver Micro contract. The
+rollover implementation counts trading dates from the current
 date through the day before expiry, including a date with only an evening or
 special session. It selects the next contract at seven or fewer such dates.
 Daily contract locks and open-position contract checks are implemented.
@@ -53,11 +52,10 @@ charges are estimates, not reconciled Dhan contract-note rates.
 For offline tests, make the `tamingnifty` source or installed package available:
 
 ```powershell
-python test_market.py
-python -m unittest test_executor test_publisher test_paper_state test_decisions test_paper test_signals
-python test_strategy.py
-python test_strategy.py --replay
-python test_strategy.py --compare-cutoff
+$env:PYTHONPATH = "$PWD;$PWD\executor;$PWD\signal"
+python tests\test_silver.py
+python tests\test_silver.py --replay
+python tests\test_silver.py --compare-cutoff
 ```
 
 The optional replay reads the historical research data in the surrounding vault;
