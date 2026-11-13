@@ -26,6 +26,16 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(second["security_id"], "101")
 
+    def test_silver_lock_and_signals_coexist_with_interceptor(self):
+        interceptor = {"_id": "nifty_options_renko", "marker": "unchanged"}
+        self.collection.insert_one(interceptor)
+        publisher.lock_contract(self.collection, "2026-11-13", contract())
+        publisher.publish(self.collection, document())
+        evening = dict(document("2026-11-13 17:00:00"), _id="silver:2026-11-13:evening")
+        publisher.publish(self.collection, evening)
+        self.assertEqual(self.collection.find_one({"_id": interceptor["_id"]}), interceptor)
+        self.assertEqual(len(self.collection.docs), 4)
+
     def test_publish_is_monotonic_and_contract_is_immutable(self):
         self.assertTrue(publisher.publish(self.collection, document()))
         self.assertFalse(publisher.publish(self.collection, document()))

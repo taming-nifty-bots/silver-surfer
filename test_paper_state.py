@@ -108,6 +108,19 @@ class PaperStateTests(unittest.TestCase):
             paper_state.close_position(self.states, state, "channel10", quote(),
                                        "2026-11-13 10:02:01", "2026-11-13 10:02:02")
 
+    def test_state_and_trades_share_collection(self):
+        self.open(quantity=3)
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        trade = paper_state.close_position(self.states, state, "cutoff", quote(),
+                                           "2026-11-13 16:55:00", "2026-11-13 16:55:01")
+        pending = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.states.insert_one(trade.copy())
+        paper_state.archive_trade(self.states, self.states, pending)
+        state = self.states.find_one({"_id": paper_state.STATE_ID})
+        self.assertIsNone(state["pending_trade"])
+        self.assertEqual(self.states.find_one({"_id": trade["_id"]}), trade)
+        self.assertEqual(len(self.states.docs), 2)
+
     def test_conflicting_archived_record_is_not_cleared(self):
         self.open()
         state = self.states.find_one({"_id": paper_state.STATE_ID})

@@ -23,6 +23,10 @@ Paper accounting currently requires the Silver Micro contract lot size to be
 one unit and rejects an unexpected contract lot size.
 At each minute boundary, the executor allows up to 15 seconds for a fresh
 signal before raising an error; fresh signals and forced exits are not delayed.
+Daily contract locks and session signals use `Bots.supertrend`, alongside
+Interceptor's signals with separate document IDs. Paper state and closed
+trades use `Bots.silver_surfer_<user>`. The MCX calendar remains shared in
+`Bots.exchange_calendars`.
 
 `strategy.py` contains the selected Renko breakout and channel rules.
 `signals.py` builds levels from completed candles and identifies missing

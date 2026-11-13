@@ -44,9 +44,9 @@ def main():
     client = MongoClient(os.environ["CONNECTION_STRING"])
     db = client["Bots"]
     user = os.environ["user_name"]
-    locks = db[f"silver_surfer_locks_{user}"]
-    signals = db[f"silver_surfer_signals_{user}"]
-    states = db[f"silver_surfer_state_{user}"]
+    signals = db["supertrend"]
+    locks = signals
+    states = db[f"silver_surfer_{user}"]
     calendars = db["exchange_calendars"]
     last_minute = None
     last_error = None

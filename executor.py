@@ -189,9 +189,9 @@ def main():
     client = MongoClient(os.environ["CONNECTION_STRING"])
     db = client["Bots"]
     user = os.environ["user_name"]
-    states = db[f"silver_surfer_state_{user}"]
-    trades = db[f"silver_surfer_trades_{user}"]
-    signals = db[f"silver_surfer_signals_{user}"]
+    states = db[f"silver_surfer_{user}"]
+    trades = states
+    signals = db["supertrend"]
     calendars = db["exchange_calendars"]
 
     def quote_source(security_id):
