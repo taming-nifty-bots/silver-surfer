@@ -7,9 +7,13 @@ import pandas as pd
 from tamingnifty import ta
 
 
-VERSION = "silver-renko-40-10-to-7-2026-11-13"
+VERSION = "silver-renko-40-6sl-1trail-2026-11-19"
 EVENING_LAST_ENTRY = time(22, 50)
 EVENING_EXIT = time(23, 10)
+# Exit rule since 2026-11-19: a hard stop at SL_BRICKS against entry, which ratchets
+# into a 1-brick trailing stop (exit the instant the latest completed brick's color
+# flips against the trade) once price has moved SL_BRICKS in favor.
+SL_BRICKS = 6
 
 
 def chart_history(candles, day, as_of):
@@ -67,6 +71,10 @@ def entry_side(candle_time, brick):
     return None
 
 
+# profit_active and channel_exit below are kept unchanged (not used by live exit_decision
+# any more) purely as the frozen 2026-11-13 channel-exit baseline that basic_checks() and
+# replay_checks() replay for parity against the original backtest. Live trading now uses
+# ratchet_active/ratchet_exit beneath them.
 def profit_active(side, entry_price, candle_close, active):
     if side not in ("BUY", "SELL"):
         raise ValueError("Invalid entry side")
@@ -87,6 +95,39 @@ def channel_exit(side, brick, active):
         level = brick[f"upper{n}"]
         return bool(pd.notna(level) and brick["close"] > level)
     raise ValueError("Invalid entry side")
+
+
+def brick_size(session, entry_price):
+    if session not in ("morning", "evening"):
+        raise ValueError("Invalid position session")
+    box = 0.1 if session == "morning" else 0.15
+    return box / 100 * entry_price
+
+
+def ratchet_active(side, entry_price, candle_close, active, session):
+    """Same shape as profit_active, but the activation distance is SL_BRICKS of
+    bricks (a % of entry price) instead of a flat 1%."""
+    if side not in ("BUY", "SELL"):
+        raise ValueError("Invalid entry side")
+    if not math.isfinite(float(entry_price)) or float(entry_price) <= 0:
+        raise ValueError("Invalid entry price")
+    if not math.isfinite(float(candle_close)) or float(candle_close) <= 0:
+        raise ValueError("Invalid candle close")
+    direction = 1 if side == "BUY" else -1
+    threshold = SL_BRICKS * brick_size(session, entry_price)
+    return bool(active or direction * (candle_close - entry_price) >= threshold)
+
+
+def ratchet_exit(trade, candle_close, active, brick_color):
+    """Before activation: hard stop at SL_BRICKS against entry.
+    After activation: exit the instant the latest completed brick's color flips
+    against the trade's direction -- a single-brick reversal."""
+    if not active:
+        direction = 1 if trade["side"] == "BUY" else -1
+        step = brick_size(trade["session"], trade["entry_price"])
+        return bool(direction * (candle_close - trade["entry_price"]) <= -SL_BRICKS * step)
+    favorable_color = "green" if trade["side"] == "BUY" else "red"
+    return brick_color != favorable_color
 
 
 def calendar_for_day(calendars, day):
@@ -201,7 +242,7 @@ def build_signal(candles, day, now, session):
     values = dict(session=session, box_size=box, data_asof=str(as_of),
                   candle_close=float(latest["close"]), candle_volume=float(latest["volume"]),
                   brick_time=str(last["brick_time"]), close=float(last["close"]),
-                  side=entry_side(as_of, last))
+                  color=str(last["color"]), side=entry_side(as_of, last))
     for n in (7, 10, 40):
         values[f"upper{n}"] = float(last[f"upper{n}"]) if pd.notna(last[f"upper{n}"]) else None
         values[f"lower{n}"] = float(last[f"lower{n}"]) if pd.notna(last[f"lower{n}"]) else None
@@ -245,7 +286,7 @@ def recover_activation(trade, candles, now):
         raise ValueError("Duplicate candles during activation recovery")
     active = False
     for row in bars.to_dict("records"):
-        active = profit_active(trade["side"], trade["entry_price"], row["close"], active)
+        active = ratchet_active(trade["side"], trade["entry_price"], row["close"], active, trade["session"])
     return active
 
 
@@ -292,11 +333,11 @@ def exit_decision(trade, signal, now):
         raise ValueError("Exit signal is not from the immediately preceding minute")
     if candle < entry.floor("min"):
         return dict(reason=None, profit_active=trade["profit_active"])
-    active = profit_active(trade["side"], trade["entry_price"],
-                           signal["candle_close"], trade["profit_active"])
-    reason = "channel7" if active else "channel10"
-    if not channel_exit(trade["side"], signal, active):
-        reason = None
+    active = ratchet_active(trade["side"], trade["entry_price"],
+                            signal["candle_close"], trade["profit_active"], trade["session"])
+    reason = None
+    if ratchet_exit(trade, signal["candle_close"], active, signal["color"]):
+        reason = "brick1" if active else "brick6"
     return dict(reason=reason, profit_active=active)
 
 
@@ -313,7 +354,8 @@ def recover_missed_exit(trade, candles, asof):
         raise ValueError("Invalid exit recovery interval")
     frame = frame.loc[(frame["datetime"] >= start) & (frame["datetime"] <= end)]
     frame = frame.sort_values("datetime")
-    active = recover_activation(trade, candles, max(start, pd.Timestamp(trade["entry_timestamp"])))
+    since = max(start, pd.Timestamp(trade["entry_timestamp"]))
+    active = recover_activation(trade, candles, since)
     for stamp in frame["datetime"]:
         signal = build_signal(candles, stamp.date(), stamp + pd.Timedelta(minutes=1),
                               trade["session"])
