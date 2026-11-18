@@ -1,5 +1,6 @@
 """Offline Silver Surfer regression tests and optional historical replay."""
 
+import hashlib
 import os
 import sys
 import unittest
@@ -50,7 +51,8 @@ class Collection:
 
     def index_values(self, doc, name):
         if name == "silver_one_active_trade":
-            return {doc["strategy_state"]} if doc.get("strategy_state") == "active" else set()
+            return ({doc["strategy_state"]}
+                    if doc.get("strategy_state") in ("pending", "active", "closing") else set())
         if name == "silver_occupied_minutes":
             return set(doc.get("occupied_minutes", []))
         return set()
@@ -70,6 +72,7 @@ class Collection:
                 raise DuplicateKeyError("duplicate session")
             self.check_indexes(doc)
             self.docs[doc["_id"]] = deepcopy(doc)
+            return SimpleNamespace(acknowledged=True, inserted_id=doc["_id"])
 
     def find(self, query):
         with self.lock:
@@ -88,7 +91,10 @@ class Collection:
                 if not isinstance(current, dict) or part not in current:
                     return False
                 current = current[part]
-            if current != value:
+            if isinstance(value, dict) and "$in" in value:
+                if current not in value["$in"]:
+                    return False
+            elif current != value:
                 return False
         return True
 
@@ -135,6 +141,30 @@ def quote():
 
 def contract():
     return dict(security_id="101", symbol="SILVERMIC", expiry="2026-11-30", lot_size=1)
+
+
+def orders_collection(user="test"):
+    """A fake orders collection wired up with the `.name`/`.database` lookup that
+    execute_live_order uses to find its paired order-quotes audit collection."""
+    orders = Collection()
+    orders.name = f"orders_silver_surfer_{user}"
+    orders.database = {f"order_quotes_silver_surfer_{user}": Collection()}
+    return orders
+
+
+def prepared_policy():
+    return dict(deadline=None)
+
+
+def submitted_order(order_id="OID1"):
+    return dict(orderId=order_id)
+
+
+def final_order(order_id, security_id, side, quantity, filled_qty, status="TRADED",
+               price=99100, created="2026-11-13 10:02:00"):
+    return dict(orderId=order_id, orderStatus=status, filledQty=filled_qty,
+               averageTradedPrice=price, securityId=str(security_id), transactionType=side,
+               quantity=quantity, createTime=created, omsErrorDescription="")
 
 
 class PaperStateTests(unittest.TestCase):
@@ -336,7 +366,8 @@ class PaperStateTests(unittest.TestCase):
     def test_startup_creates_required_index_and_fails_on_incompatible_index(self):
         self.assertEqual(self.trades.indexes["silver_one_active_trade"],
                          dict(key=[("strategy_state", 1)], name="silver_one_active_trade",
-                              unique=True, partialFilterExpression={"strategy_state": "active"}))
+                              unique=True, partialFilterExpression={
+                                  "strategy_state": {"$in": list(executor.ACTIVE_STATES)}}))
         self.assertNotIn("silver_occupied_minutes", self.trades.indexes)
         self.trades.indexes["silver_one_active_trade"]["unique"] = False
         with self.assertRaises(OperationFailure):
@@ -402,7 +433,7 @@ class PaperStateTests(unittest.TestCase):
 def decision_signal():
     return dict(session="morning", security_id="101", data_asof="2026-11-13 10:00:00",
                 brick_time="2026-11-13 10:00:00", candle_volume=1,
-                candle_close=101000.0, close=100000.0, side="BUY",
+                candle_close=101000.0, close=100000.0, color="green", side="BUY",
                 upper7=103000.0, lower7=100001.0,
                 upper10=103000.0, lower10=99000.0)
 
@@ -433,18 +464,47 @@ class DecisionTests(unittest.TestCase):
         doc.update(data_asof="2026-11-13 16:54", brick_time="2026-11-13 16:54")
         self.assertIsNone(decisions.entry_decision(doc, "2026-11-13 16:55", True))
 
-    def test_exit_activation_and_channel(self):
-        result = decisions.exit_decision(trade(), decision_signal(), "2026-11-13 10:01")
-        self.assertEqual(result, dict(reason="channel7", profit_active=True))
+    def test_exit_activation_and_brick_reversal(self):
         doc = decision_signal()
-        doc["candle_close"] = 100999
+        doc["color"] = "red"
+        result = decisions.exit_decision(trade(), doc, "2026-11-13 10:01")
+        self.assertEqual(result, dict(reason="brick1", profit_active=True))
+        doc = decision_signal()
+        doc["candle_close"] = 100500
         self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
                          dict(reason=None, profit_active=False))
         doc["candle_close"] = 98000
         position = dict(trade(), side="SELL")
-        doc["close"] = 104000
+        doc["color"] = "green"
         self.assertEqual(decisions.exit_decision(position, doc, "2026-11-13 10:01"),
-                         dict(reason="channel7", profit_active=True))
+                         dict(reason="brick1", profit_active=True))
+
+    def test_pre_activation_hard_stop_at_six_bricks(self):
+        doc = decision_signal()
+        doc["candle_close"] = 99400  # 6 bricks of 100 each against a 100000 BUY entry
+        self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
+                         dict(reason="brick6", profit_active=False))
+        doc["candle_close"] = 99401  # one rupee short of the stop: no exit yet
+        self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
+                         dict(reason=None, profit_active=False))
+
+    def test_activation_requires_exactly_six_bricks_in_favor(self):
+        doc = decision_signal()
+        doc["color"] = "green"
+        doc["candle_close"] = 100599  # short of the 6-brick (600) activation distance
+        self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
+                         dict(reason=None, profit_active=False))
+        doc["candle_close"] = 100600  # exactly 6 bricks in favor: activates
+        self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
+                         dict(reason=None, profit_active=True))
+
+    def test_post_activation_same_color_brick_does_not_exit(self):
+        position = dict(trade(), profit_active=True)
+        doc = decision_signal()
+        doc["candle_close"] = 100700
+        doc["color"] = "green"
+        self.assertEqual(decisions.exit_decision(position, doc, "2026-11-13 10:01"),
+                         dict(reason=None, profit_active=True))
 
     def test_force_close_without_signal(self):
         self.assertEqual(decisions.exit_decision(trade(), None, "2026-11-13 16:55")["reason"],
@@ -510,12 +570,12 @@ class DecisionTests(unittest.TestCase):
         candles = pd.DataFrame([dict(datetime="2026-11-13 10:01", close=99000),
                                 dict(datetime="2026-11-13 10:00", close=101000)])
         first = dict(decision_signal(), data_asof="2026-11-13 10:00:00", candle_close=101000,
-                     close=100500, lower7=100000)
+                     close=100500, lower7=100000, color="green")
         second = dict(decision_signal(), data_asof="2026-11-13 10:01:00", candle_close=99000,
-                      close=99000, lower7=100000)
+                      close=99000, lower7=100000, color="red")
         with patch("strategy.build_signal", side_effect=[first, second]):
             result = decisions.recover_missed_exit(position, candles, "2026-11-13 10:01")
-        self.assertEqual(result, dict(reason="channel7", profit_active=True,
+        self.assertEqual(result, dict(reason="brick1", profit_active=True,
                                       data_asof="2026-11-13 10:01:00"))
 
     def test_recovery_reconstructs_activation_before_checkpoint(self):
@@ -525,10 +585,10 @@ class DecisionTests(unittest.TestCase):
                                 dict(datetime="2026-11-13 10:00", close=100000),
                                 dict(datetime="2026-11-13 10:01", close=99000)])
         current = dict(decision_signal(), data_asof="2026-11-13 10:01:00",
-                       candle_close=99000, close=99000, lower7=100000)
+                       candle_close=99000, close=99000, lower7=100000, color="red")
         with patch("strategy.build_signal", return_value=current):
             result = decisions.recover_missed_exit(position, candles, "2026-11-13 10:01")
-        self.assertEqual(result["reason"], "channel7")
+        self.assertEqual(result["reason"], "brick1")
 
 
 def failed_alert(message):
@@ -544,7 +604,7 @@ class ExecutorTests(unittest.TestCase):
         self.doc = dict(signal(), _id="silver:morning",
                         strategy_version=strategy.VERSION, contract=contract(),
                         expiry=contract()["expiry"], candle_close=99000,
-                        close=99000, lower7=98000, lower10=97000,
+                        close=99000, color="green", lower7=98000, lower10=97000,
                         upper7=101000, upper10=102000)
         self.signals.insert_one(self.doc)
 
@@ -569,13 +629,13 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(state["position"]["entry_price"], 99000)
         self.now = datetime(2026, 11, 13, 10, 2, 2)
         self.doc.update(data_asof="2026-11-13 10:01:00", brick_time="2026-11-13 10:01:00",
-                        candle_close=100000, close=97000)
+                        candle_close=100000, close=97000, color="red")
         self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
         self.cycle()
         state = paper_state.create_state(self.trades)
         self.assertIsNone(state["position"])
         trade = self.trades.find_one({"_id": "silver:2026-11-13:morning"})
-        self.assertEqual(trade["exit_reason"], "channel7")
+        self.assertEqual(trade["exit_reason"], "brick1")
         self.assertEqual(trade["pnl"], -2000)
         with patch("strategy.session_status", return_value=dict(morning=True, evening=True)):
             self.cycle()
@@ -589,7 +649,7 @@ class ExecutorTests(unittest.TestCase):
                                self.get_candles, self.clock, self.alerts.append, 3)
         self.now = datetime(2026, 11, 13, 10, 2, 2)
         self.doc.update(data_asof="2026-11-13 10:01:00", brick_time="2026-11-13 10:01:00",
-                        candle_close=97000, close=103000)
+                        candle_close=98000, close=103000)
         self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
         with patch.object(self, "get_candles", return_value=pd.DataFrame(
                 [dict(datetime="2026-11-13 10:01", close=97000)])):
@@ -626,17 +686,20 @@ class ExecutorTests(unittest.TestCase):
                     self.assertRaises(ValueError):
                 executor.main()
 
-    def test_live_and_invalid_modes_fail_before_connecting(self):
+    def test_invalid_live_trading_modes_fail_before_connecting(self):
+        # "true"/"false" are the only accepted modes; anything else must still be
+        # rejected before Mongo/Dhan are touched. ("true" itself is covered by the
+        # live-mode tests below, which actually drive it through a real cycle.)
         environment = dict(CONNECTION_STRING="offline", user_name="test", slack_token="offline",
                            DHAN_CLIENT_ID="offline", DHAN_PIN="offline", DHAN_TOTP="offline",
                            SILVER_SESSION="morning", quantity="1")
-        for mode in ("true", "1", "live", ""):
+        for mode in ("1", "live", "bogus", ""):
             with self.subTest(mode=mode), \
                     patch.dict(os.environ, dict(environment, live_trading=mode), clear=True), \
                     patch("executor.load_dotenv"), patch("executor.find_dotenv", return_value=""), \
                     patch("executor.MongoClient") as mongo, \
                     patch.object(executor.dhan, "login_to_dhan") as login:
-                with self.assertRaisesRegex(ValueError, "live orders are disabled"):
+                with self.assertRaisesRegex(ValueError, "live_trading must be true or false"):
                     executor.main()
                 mongo.assert_not_called()
                 login.assert_not_called()
@@ -648,6 +711,7 @@ class ExecutorTests(unittest.TestCase):
         trade_collection = MagicMock()
         trade_collection.with_options.return_value = self.trades
         collections = dict(supertrend=self.signals, silver_surfer_test=trade_collection,
+                           orders_silver_surfer_test=orders_collection(),
                            exchange_calendars=Collection())
         database = MagicMock()
         database.__getitem__.side_effect = collections.__getitem__
@@ -679,6 +743,63 @@ class ExecutorTests(unittest.TestCase):
         concerns = trade_collection.with_options.call_args.kwargs
         self.assertEqual(concerns["write_concern"].document, {"w": "majority"})
         self.assertEqual(concerns["read_concern"].document, {"level": "majority"})
+        client.close.assert_called_once_with()
+
+    def test_live_main_runs_entry_and_cutoff_exit_through_real_order_calls(self):
+        """End-to-end: claim -> confirm entry -> begin exit -> confirm exit, all
+        driven through main()'s own loop/delay logic, with every Dhan order call
+        mocked. Confirms live_trading=true actually wires the orders collection,
+        connection source and adaptive polling delay together without crashing."""
+        environment = dict(CONNECTION_STRING="offline", user_name="test", slack_token="offline",
+                           DHAN_CLIENT_ID="offline", DHAN_PIN="offline", DHAN_TOTP="offline",
+                           SILVER_SESSION="morning", live_trading="true", quantity="2")
+        trade_collection = MagicMock()
+        trade_collection.with_options.return_value = self.trades
+        collections = dict(supertrend=self.signals, silver_surfer_test=trade_collection,
+                           orders_silver_surfer_test=orders_collection(),
+                           exchange_calendars=Collection())
+        database = MagicMock()
+        database.__getitem__.side_effect = collections.__getitem__
+        client = MagicMock()
+        client.__getitem__.return_value = database
+
+        def pace(seconds):
+            # Only jump to the cutoff once the entry is confirmed active; leave
+            # time alone while an order is pending/closing so the next cycle
+            # reconciles it rather than skipping straight past it.
+            position = self.trades.find_one({"strategy_state": {"$in": list(executor.ACTIVE_STATES)}})
+            if position is not None and position["strategy_state"] == "active":
+                self.now = datetime(2026, 11, 13, 16, 55)
+
+        def wait_for_fill(conn, order_id, **kwargs):
+            if kwargs["audit_id"].endswith(":ENTRY"):
+                return final_order(order_id, "101", "BUY", 2, 2, price=99100)
+            return final_order(order_id, "101", "SELL", 2, 2, price=99400)
+
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(executor, "load_dotenv"), \
+                patch.object(executor, "find_dotenv", return_value=""), \
+                patch.object(executor, "MongoClient", return_value=client), \
+                patch.object(executor, "WebClient"), \
+                patch.object(executor, "notify"), \
+                patch.object(executor, "now_ist", side_effect=self.clock), \
+                patch.object(executor.time, "sleep", side_effect=pace), \
+                patch.object(executor.dhan, "login_to_dhan"), \
+                patch.object(executor.dhan, "get_commodity_ltp", return_value=99150), \
+                patch.object(executor.dhan, "prepare_order", return_value=prepared_policy()), \
+                patch.object(executor.dhan, "submit_prepared_order",
+                             side_effect=[submitted_order("OID1"), submitted_order("OID2")]), \
+                patch.object(executor.dhan, "wait_for_fill", side_effect=wait_for_fill), \
+                patch.object(strategy, "session_status", return_value=dict(morning=True, evening=True)):
+            executor.main()
+        self.assertEqual(len(self.trades.docs), 1)
+        trade = self.trades.find_one({"_id": "silver:2026-11-13:morning"})
+        self.assertEqual(trade["strategy_state"], "closed")
+        self.assertEqual(trade["entry_price"], 99100)
+        self.assertEqual(trade["exit_price"], 99400)
+        self.assertEqual(trade["exit_reason"], "session cutoff")
+        self.assertEqual(trade["pnl"], 600)
+        self.assertAlmostEqual(trade["net_pnl"], trade["pnl"] - trade["charges"]["total"], places=2)
         client.close.assert_called_once_with()
 
     def test_entry_persisted_before_alert_failure_is_not_repeated(self):
@@ -754,14 +875,14 @@ class ExecutorTests(unittest.TestCase):
             self.cycle()
         state = paper_state.create_state(self.trades)
         paper_state.checkpoint_signal(self.trades, state, "2026-11-13 23:07:00")
-        self.doc.update(data_asof="2026-11-13 23:08:00", candle_close=99000, close=96000)
+        self.doc.update(data_asof="2026-11-13 23:08:00", candle_close=98000, close=96000)
         self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
         self.now = datetime(2026, 11, 13, 23, 9, 20)
         with patch.object(self, "get_candles", return_value=pd.DataFrame(
                 [dict(datetime="2026-11-13 23:08", close=99000)])):
             self.cycle()
         trade = self.trades.find_one({"_id": "silver:2026-11-13:evening"})
-        self.assertEqual(trade["exit_reason"], "channel10")
+        self.assertEqual(trade["exit_reason"], "brick6")
 
     def test_evening_cutoff_during_candle_fetch_and_failed_quote_retry(self):
         self.now = datetime(2026, 11, 13, 22, 1)
@@ -891,7 +1012,7 @@ class ExecutorTests(unittest.TestCase):
             self.cycle()
         self.now = datetime(2026, 11, 13, 10, 2, 2)
         self.doc.update(data_asof="2026-11-13 10:01:00", brick_time="2026-11-13 10:01:00",
-                        candle_close=100000, close=97000)
+                        candle_close=100000, close=97000, color="red")
         self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
         with patch.object(self, "get_quote", side_effect=ValueError("No quote")):
             with self.assertRaises(ValueError):
@@ -914,8 +1035,157 @@ class ExecutorTests(unittest.TestCase):
                 patch("strategy.build_signal", side_effect=rebuild):
             self.cycle()
         self.assertEqual(self.trades.find_one({"_id": "silver:2026-11-13:morning"})["exit_reason"],
-                         "channel7")
+                         "brick1")
         self.assertTrue(any("Signal unavailable" in text for text in self.alerts))
+
+
+class LiveExecutorTests(unittest.TestCase):
+    """Unit coverage for the live (real-order) functions, plus one full
+    run_cycle lifecycle test (claim -> confirm entry -> begin exit -> confirm
+    exit) exercising the pending/closing reconciliation branch added to
+    run_cycle. dhan's broker calls are mocked throughout; only the
+    pending/active/closing state machine and Mongo documents are real."""
+
+    def setUp(self):
+        self.trades, self.signals = Collection(), Collection()
+        paper_state.initialize_store(self.trades)
+        self.orders = orders_collection()
+        self.alerts = []
+        self.now = datetime(2026, 11, 13, 10, 1, 2)
+        self.conn = object()
+        self.doc = dict(signal(), _id="silver:morning", strategy_version=strategy.VERSION,
+                        contract=contract(), expiry=contract()["expiry"], candle_close=99000,
+                        close=99000, color="green", lower7=98000, lower10=97000,
+                        upper7=101000, upper10=102000)
+
+    def clock(self):
+        return self.now
+
+    def claim(self, side="BUY", quantity=2):
+        state = paper_state.create_state(self.trades)
+        return executor.claim_live_entry(self.trades, state, dict(self.doc, side=side),
+                                         contract(), quantity, self.now)
+
+    def test_claim_live_entry_reserves_slot_without_submitting_an_order(self):
+        trade = self.claim()
+        self.assertEqual(trade["strategy_state"], "pending")
+        self.assertNotIn("entry_price", trade)
+        self.assertEqual(self.trades.find_one({"_id": trade["_id"]})["strategy_state"], "pending")
+        self.assertEqual(self.orders.docs, {})
+
+    def test_confirm_live_entry_full_fill_activates_position(self):
+        trade = self.claim(quantity=2)
+        order = final_order("OID1", "101", "BUY", 2, 2, price=99100)
+        with patch.object(executor.dhan, "prepare_order", return_value=prepared_policy()), \
+                patch.object(executor.dhan, "submit_prepared_order", return_value=submitted_order()), \
+                patch.object(executor.dhan, "wait_for_fill", return_value=order):
+            confirmed = executor.confirm_live_entry(self.conn, self.trades, self.orders, trade, self.now)
+        self.assertEqual(confirmed["strategy_state"], "active")
+        self.assertEqual(confirmed["entry_price"], 99100)
+        self.assertEqual(confirmed["quantity"], 2)
+        self.assertEqual(confirmed["last_checked_asof"], trade["entry_signal"])
+        self.assertAlmostEqual(confirmed["charges"]["total"], sum_charges(
+            silver_micro_estimated_order_charges("BUY", 99100, 2))["total"], places=2)
+
+    def test_confirm_live_entry_partial_fill_moves_straight_to_closing(self):
+        trade = self.claim(quantity=2)
+        order = final_order("OID1", "101", "BUY", 2, 1, status="CANCELLED", price=99100)
+        with patch.object(executor.dhan, "prepare_order", return_value=prepared_policy()), \
+                patch.object(executor.dhan, "submit_prepared_order", return_value=submitted_order()), \
+                patch.object(executor.dhan, "wait_for_fill", return_value=order):
+            confirmed = executor.confirm_live_entry(self.conn, self.trades, self.orders, trade, self.now)
+        self.assertEqual(confirmed["strategy_state"], "closing")
+        self.assertEqual(confirmed["quantity"], 1)
+        self.assertIn("flatten", confirmed["exit_reason"])
+
+    def test_confirm_live_entry_zero_fill_aborts_and_consumes_the_session(self):
+        trade = self.claim(quantity=2)
+        order = final_order("OID1", "101", "BUY", 2, 0, status="REJECTED", price=99100)
+        with patch.object(executor.dhan, "prepare_order", return_value=prepared_policy()), \
+                patch.object(executor.dhan, "submit_prepared_order", return_value=submitted_order()), \
+                patch.object(executor.dhan, "wait_for_fill", return_value=order):
+            confirmed = executor.confirm_live_entry(self.conn, self.trades, self.orders, trade, self.now)
+        self.assertIsNone(confirmed)
+        aborted = self.trades.find_one({"_id": trade["_id"]})
+        self.assertEqual(aborted["strategy_state"], "aborted")
+
+    def test_execute_live_order_recovers_a_submitted_order_via_correlation(self):
+        trade = self.claim(quantity=2)
+        key = executor.live_order_key(trade["_id"], "ENTRY")
+        correlation = hashlib.sha256(key.encode("utf-8")).hexdigest()[:30]
+        self.orders.insert_one(dict(_id=key, orderStatus="SUBMITTING", transactionType="BUY",
+                                    securityId="101", tradingSymbol="SILVERMIC", quantity=2,
+                                    simulated=False, strategy_version=strategy.VERSION,
+                                    prepared=prepared_policy(), correlationId=correlation))
+        recovered = final_order("OID9", "101", "BUY", 2, 2, price=99100)
+        with patch.object(executor.dhan, "order_by_correlation", return_value=recovered) as lookup, \
+                patch.object(executor.dhan, "prepare_order") as prepare, \
+                patch.object(executor.dhan, "wait_for_fill", return_value=recovered):
+            order = executor.execute_live_order(self.conn, self.orders, key, "101", "SILVERMIC",
+                                                "BUY", 2, "ENTRY", self.now)
+        prepare.assert_not_called()
+        lookup.assert_called_once_with(self.conn, correlation)
+        self.assertEqual(order["orderId"], "OID9")
+
+    def test_execute_live_order_detects_a_contract_mismatch(self):
+        trade = self.claim(quantity=2)
+        key = executor.live_order_key(trade["_id"], "ENTRY")
+        mismatched = final_order("OID1", "999", "BUY", 2, 2, price=99100)
+        with patch.object(executor.dhan, "prepare_order", return_value=prepared_policy()), \
+                patch.object(executor.dhan, "submit_prepared_order", return_value=submitted_order()), \
+                patch.object(executor.dhan, "wait_for_fill", return_value=mismatched), \
+                self.assertRaisesRegex(ValueError, "mismatch"):
+            executor.execute_live_order(self.conn, self.orders, key, "101", "SILVERMIC",
+                                        "BUY", 2, "ENTRY", self.now)
+
+    def test_run_cycle_live_lifecycle_claim_confirm_exit_confirm(self):
+        self.signals.insert_one(self.doc)
+
+        def get_candles(position):
+            return pd.DataFrame([dict(datetime="2026-11-13 10:01", close=100000)])
+
+        def cycle():
+            executor.run_cycle(self.trades, self.signals, None, None, get_candles,
+                               self.clock, self.alerts.append, 2, simulated=False,
+                               orders=self.orders, conn_source=lambda: self.conn)
+
+        with patch("strategy.session_status", return_value=dict(morning=True, evening=True)):
+            cycle()
+        trade = self.trades.find_one({"_id": "silver:2026-11-13:morning"})
+        self.assertEqual(trade["strategy_state"], "pending")
+        self.assertTrue(any("submitting live order" in text for text in self.alerts))
+
+        entry_order = final_order("OID1", "101", "BUY", 2, 2, price=99100)
+        with patch.object(executor.dhan, "prepare_order", return_value=prepared_policy()), \
+                patch.object(executor.dhan, "submit_prepared_order", return_value=submitted_order("OID1")), \
+                patch.object(executor.dhan, "wait_for_fill", return_value=entry_order):
+            cycle()
+        trade = self.trades.find_one({"_id": "silver:2026-11-13:morning"})
+        self.assertEqual(trade["strategy_state"], "active")
+        self.assertEqual(trade["entry_price"], 99100)
+        self.assertTrue(any("(live)" in text for text in self.alerts))
+
+        self.now = datetime(2026, 11, 13, 10, 2, 2)
+        self.doc.update(data_asof="2026-11-13 10:01:00", brick_time="2026-11-13 10:01:00",
+                        candle_close=100000, close=97000, color="red")
+        self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
+        cycle()
+        trade = self.trades.find_one({"_id": "silver:2026-11-13:morning"})
+        self.assertEqual(trade["strategy_state"], "closing")
+        self.assertEqual(trade["exit_reason"], "brick1")
+        self.assertTrue(any("Exit requested" in text for text in self.alerts))
+
+        exit_order = final_order("OID2", "101", "SELL", 2, 2, price=99400)
+        with patch.object(executor.dhan, "prepare_order", return_value=prepared_policy()), \
+                patch.object(executor.dhan, "submit_prepared_order", return_value=submitted_order("OID2")), \
+                patch.object(executor.dhan, "wait_for_fill", return_value=exit_order):
+            cycle()
+        trade = self.trades.find_one({"_id": "silver:2026-11-13:morning"})
+        self.assertEqual(trade["strategy_state"], "closed")
+        self.assertEqual(trade["exit_price"], 99400)
+        self.assertEqual(trade["pnl"], 600)
+        self.assertAlmostEqual(trade["net_pnl"], trade["pnl"] - trade["charges"]["total"], places=2)
+        self.assertEqual(len(self.trades.docs), 1)
 
 
 def calendar_checks():
@@ -1107,7 +1377,7 @@ class SignalTests(unittest.TestCase):
                                   open=100000, high=100001, low=99999,
                                   close=100000, volume=1)])
         brick = dict(datetime=pd.Timestamp("2026-11-13 17:00"),
-                     brick_time=pd.Timestamp("2026-11-13 17:00"), close=100001,
+                     brick_time=pd.Timestamp("2026-11-13 17:00"), close=100001, color="green",
                      upper40=100000, lower40=90000, upper10=100000, lower10=90000,
                      upper7=100000, lower7=90000)
         with patch.object(signals, "chart_history", return_value=bars), \

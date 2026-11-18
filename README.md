@@ -13,9 +13,25 @@ can delay the simulated fill, so the executor continues retrying and alerts.
 The prior 23:00-cutoff replay does not validate these changed evening rules.
 Signal publication and executor startup were verified for the earlier
 single-day deployment; a completed paper trade, scheduled restart and
-real-world recovery remain unverified. Live execution
-is deliberately disabled; setting `live_trading` to anything other than
-`false` stops the executor.
+real-world recovery remain unverified.
+Setting `live_trading` to `true` places real Dhan MCX orders instead of
+paper fills; `false` keeps the executor on simulated fills as before, and any
+other value fails at startup. A live trade occupies the session slot from the
+moment its entry order is submitted (`pending`), through `active`, to
+`closing` while its exit order is in flight, until `closed`; `aborted` marks
+a zero-fill entry that still consumed the session. Live orders go through
+Dhan's `MCX_COMM`/`MARGIN` depth-based pricing (`best_price_first`, no spread
+check) for both entry and exit, on either side; tamingnifty's BUY-only
+price-cap/deadline escalation is not used, so a live order can fill at a
+worse price than the last quote with no cancel-and-retry ceiling. Entry and
+exit orders are correlation-ID keyed and idempotent: a crash between
+submitting and recording the broker's response is recovered from Dhan rather
+than resubmitted. A partially filled entry is flattened immediately at the
+actual filled quantity; an exit order must fill in full or it is left for
+reconciliation rather than quietly accepted. Order intents and fills are kept
+in `Bots.orders_silver_surfer_<user>`, with execution-quote audit entries in
+the paired `Bots.order_quotes_silver_surfer_<user>` collection, alongside the
+existing `Bots.silver_surfer_<user>` trade documents.
 Each executor requires the `quantity` environment variable, a positive whole
 number of contract units and a multiple of the Dhan lot size. Set it to `1`
 for the current one-lot forward test. A position retains its entry quantity
