@@ -467,26 +467,38 @@ class DecisionTests(unittest.TestCase):
     def test_exit_activation_and_brick_reversal(self):
         doc = decision_signal()
         doc["color"] = "red"
+        doc["candle_close"] = 100700  # activates (>=6 bricks) but short of the 10-brick book level
         result = decisions.exit_decision(trade(), doc, "2026-11-13 10:01")
         self.assertEqual(result, dict(reason="brick1", profit_active=True))
         doc = decision_signal()
         doc["candle_close"] = 100500
         self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
                          dict(reason=None, profit_active=False))
-        doc["candle_close"] = 98000
+        doc["candle_close"] = 99300  # 7 bricks in favor of a SELL: activates, short of the book level
         position = dict(trade(), side="SELL")
         doc["color"] = "green"
         self.assertEqual(decisions.exit_decision(position, doc, "2026-11-13 10:01"),
                          dict(reason="brick1", profit_active=True))
 
-    def test_pre_activation_hard_stop_at_six_bricks(self):
+    def test_pre_activation_uses_channel10_stop(self):
         doc = decision_signal()
-        doc["candle_close"] = 99400  # 6 bricks of 100 each against a 100000 BUY entry
+        doc["candle_close"] = 100000  # no activation movement yet
+        doc["close"] = 98999  # last completed brick closed just below the channel10 floor (99000)
         self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
-                         dict(reason="brick6", profit_active=False))
-        doc["candle_close"] = 99401  # one rupee short of the stop: no exit yet
+                         dict(reason="channel10", profit_active=False))
+        doc["close"] = 99001  # just inside the channel: no exit yet
         self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
                          dict(reason=None, profit_active=False))
+
+    def test_profit_booked_in_full_at_ten_bricks_regardless_of_color(self):
+        doc = decision_signal()
+        doc["color"] = "green"  # favorable color for the BUY trade -- would never trigger brick1
+        doc["candle_close"] = 100999  # just short of the 10-brick (1000) book level
+        self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
+                         dict(reason=None, profit_active=True))
+        doc["candle_close"] = 101000  # exactly 10 bricks in favor: book the full position
+        self.assertEqual(decisions.exit_decision(trade(), doc, "2026-11-13 10:01"),
+                         dict(reason="book10", profit_active=True))
 
     def test_activation_requires_exactly_six_bricks_in_favor(self):
         doc = decision_signal()
@@ -569,7 +581,7 @@ class DecisionTests(unittest.TestCase):
         position = dict(trade(), last_checked_asof="2026-11-13 09:59:00")
         candles = pd.DataFrame([dict(datetime="2026-11-13 10:01", close=99000),
                                 dict(datetime="2026-11-13 10:00", close=101000)])
-        first = dict(decision_signal(), data_asof="2026-11-13 10:00:00", candle_close=101000,
+        first = dict(decision_signal(), data_asof="2026-11-13 10:00:00", candle_close=100700,
                      close=100500, lower7=100000, color="green")
         second = dict(decision_signal(), data_asof="2026-11-13 10:01:00", candle_close=99000,
                       close=99000, lower7=100000, color="red")
@@ -629,7 +641,7 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(state["position"]["entry_price"], 99000)
         self.now = datetime(2026, 11, 13, 10, 2, 2)
         self.doc.update(data_asof="2026-11-13 10:01:00", brick_time="2026-11-13 10:01:00",
-                        candle_close=100000, close=97000, color="red")
+                        candle_close=99700, close=97000, color="red")
         self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
         self.cycle()
         state = paper_state.create_state(self.trades)
@@ -882,7 +894,7 @@ class ExecutorTests(unittest.TestCase):
                 [dict(datetime="2026-11-13 23:08", close=99000)])):
             self.cycle()
         trade = self.trades.find_one({"_id": "silver:2026-11-13:evening"})
-        self.assertEqual(trade["exit_reason"], "brick6")
+        self.assertEqual(trade["exit_reason"], "channel10")
 
     def test_evening_cutoff_during_candle_fetch_and_failed_quote_retry(self):
         self.now = datetime(2026, 11, 13, 22, 1)
@@ -1012,7 +1024,7 @@ class ExecutorTests(unittest.TestCase):
             self.cycle()
         self.now = datetime(2026, 11, 13, 10, 2, 2)
         self.doc.update(data_asof="2026-11-13 10:01:00", brick_time="2026-11-13 10:01:00",
-                        candle_close=100000, close=97000, color="red")
+                        candle_close=99700, close=97000, color="red")
         self.signals.replace_one({"_id": self.doc["_id"]}, self.doc)
         with patch.object(self, "get_quote", side_effect=ValueError("No quote")):
             with self.assertRaises(ValueError):
@@ -1029,7 +1041,7 @@ class ExecutorTests(unittest.TestCase):
 
         def rebuild(candles, day, now, session):
             asof = pd.Timestamp(now).floor("min") - pd.Timedelta(minutes=1)
-            return dict(self.doc, data_asof=str(asof), candle_close=100000, close=97000)
+            return dict(self.doc, data_asof=str(asof), candle_close=99700, close=97000)
 
         with patch.object(self, "get_candles", return_value=candles), \
                 patch("strategy.build_signal", side_effect=rebuild):
@@ -1362,6 +1374,59 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual({call.args[0] for call in database.__getitem__.call_args_list},
                          set(collections))
         client.close.assert_called_once_with()
+
+    def run_signal_main(self, times, build_signal_side_effect):
+        environment = dict(CONNECTION_STRING="offline", user_name="test", slack_token="offline",
+                           DHAN_CLIENT_ID="offline", DHAN_PIN="offline", DHAN_TOTP="offline",
+                           SILVER_SESSION="morning")
+        trades = Collection()
+        calendars = Collection()
+        database = MagicMock()
+        collections = dict(supertrend=self.collection, silver_surfer_test=trades,
+                           exchange_calendars=calendars)
+        database.__getitem__.side_effect = collections.__getitem__
+        client = MagicMock()
+        client.__getitem__.return_value = database
+        notify_mock = MagicMock()
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(publisher, "load_dotenv"), \
+                patch.object(publisher, "find_dotenv", return_value=""), \
+                patch.object(publisher, "MongoClient", return_value=client), \
+                patch.object(publisher, "WebClient"), \
+                patch.object(publisher, "notify", notify_mock), \
+                patch.object(publisher, "now_ist", side_effect=times), \
+                patch.object(publisher.time, "sleep"), \
+                patch.object(publisher.dhan, "load_instruments"), \
+                patch.object(publisher.dhan, "login_to_dhan"), \
+                patch.object(publisher.dhan, "fetch_candles", return_value=pd.DataFrame()), \
+                patch.object(strategy, "silver_contract", return_value=contract()), \
+                patch.object(strategy, "session_status", return_value=dict(morning=True, evening=True)), \
+                patch.object(strategy, "build_signal", side_effect=build_signal_side_effect), \
+                patch.object(strategy, "session_gaps", return_value=[]):
+            publisher.main()
+        return [call.args[1] for call in notify_mock.call_args_list]
+
+    def test_signal_job_suppresses_cold_start_no_candle_error(self):
+        cold_start = datetime(2026, 11, 13, 9, 0, 30)
+        warmed_up = datetime(2026, 11, 13, 9, 1, 5)
+        cutoff = datetime(2026, 11, 13, 16, 55)
+        times = [cold_start, cold_start, cold_start, warmed_up, warmed_up, cutoff]
+        signal = dict(data_asof="2026-11-13 09:01:00", session="morning")
+        messages = self.run_signal_main(
+            times, [ValueError("No completed candles for the current trading day"), signal])
+        self.assertTrue(any(m.startswith("Started") for m in messages))
+        self.assertFalse(any(m.startswith("ERROR:") for m in messages))
+        self.assertNotIn("Signal recovered", messages)
+        self.assertIn("silver:morning", self.collection.docs)
+
+    def test_signal_job_still_alerts_on_other_errors(self):
+        cold_start = datetime(2026, 11, 13, 9, 0, 30)
+        warmed_up = datetime(2026, 11, 13, 9, 1, 5)
+        cutoff = datetime(2026, 11, 13, 16, 55)
+        times = [cold_start, cold_start, cold_start, warmed_up, warmed_up, cutoff]
+        signal = dict(data_asof="2026-11-13 09:01:00", session="morning")
+        messages = self.run_signal_main(times, [ValueError("boom"), signal])
+        self.assertTrue(any(m.startswith("ERROR:") and m.endswith("boom") for m in messages))
 
 
 class SignalTests(unittest.TestCase):

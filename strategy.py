@@ -7,13 +7,18 @@ import pandas as pd
 from tamingnifty import ta
 
 
-VERSION = "silver-renko-40-6sl-1trail-2026-11-19"
+VERSION = "silver-renko-40-channel10-6-1trail-10book-2026-11-19"
 EVENING_LAST_ENTRY = time(22, 50)
 EVENING_EXIT = time(23, 10)
-# Exit rule since 2026-11-19: a hard stop at SL_BRICKS against entry, which ratchets
-# into a 1-brick trailing stop (exit the instant the latest completed brick's color
-# flips against the trade) once price has moved SL_BRICKS in favor.
+# Exit rule since 2026-11-19 (hybrid + profit book): before SL_BRICKS of favorable
+# movement, the stop is the old channel10 rolling-channel stop (see channel_exit).
+# Once price has moved SL_BRICKS in favor, it ratchets into a 1-brick trailing stop
+# (exit the instant the latest completed brick's color flips against the trade) --
+# except that once price reaches BOOK_BRICKS in favor, the full position is booked
+# immediately regardless of brick color, capturing trend trades the 1-brick trail
+# would otherwise give back piece by piece.
 SL_BRICKS = 6
+BOOK_BRICKS = 10
 
 
 def chart_history(candles, day, as_of):
@@ -71,10 +76,11 @@ def entry_side(candle_time, brick):
     return None
 
 
-# profit_active and channel_exit below are kept unchanged (not used by live exit_decision
-# any more) purely as the frozen 2026-11-13 channel-exit baseline that basic_checks() and
-# replay_checks() replay for parity against the original backtest. Live trading now uses
-# ratchet_active/ratchet_exit beneath them.
+# profit_active below is kept unchanged (not used by live exit_decision any more) purely
+# as the frozen 2026-11-13 profit-activation baseline that basic_checks() and
+# replay_checks() replay for parity against the original backtest. channel_exit is also
+# part of that frozen baseline, but is reused live (always with active=False, i.e. its
+# n=10 channel) as the hybrid rule's pre-activation stop -- see ratchet_exit below.
 def profit_active(side, entry_price, candle_close, active):
     if side not in ("BUY", "SELL"):
         raise ValueError("Invalid entry side")
@@ -118,16 +124,20 @@ def ratchet_active(side, entry_price, candle_close, active, session):
     return bool(active or direction * (candle_close - entry_price) >= threshold)
 
 
-def ratchet_exit(trade, candle_close, active, brick_color):
-    """Before activation: hard stop at SL_BRICKS against entry.
-    After activation: exit the instant the latest completed brick's color flips
-    against the trade's direction -- a single-brick reversal."""
+def ratchet_exit(trade, signal, active):
+    """Before activation: the channel10 rolling-channel stop (channel_exit's n=10
+    branch). After activation: book the full position once price has moved
+    BOOK_BRICKS bricks in favor (regardless of brick color); otherwise exit the
+    instant the latest completed brick's color flips against the trade's
+    direction -- a single-brick reversal. Returns the exit reason, or None."""
     if not active:
-        direction = 1 if trade["side"] == "BUY" else -1
-        step = brick_size(trade["session"], trade["entry_price"])
-        return bool(direction * (candle_close - trade["entry_price"]) <= -SL_BRICKS * step)
+        return "channel10" if channel_exit(trade["side"], signal, False) else None
+    direction = 1 if trade["side"] == "BUY" else -1
+    step = brick_size(trade["session"], trade["entry_price"])
+    if direction * (signal["candle_close"] - trade["entry_price"]) >= BOOK_BRICKS * step:
+        return "book10"
     favorable_color = "green" if trade["side"] == "BUY" else "red"
-    return brick_color != favorable_color
+    return None if signal["color"] == favorable_color else "brick1"
 
 
 def calendar_for_day(calendars, day):
@@ -335,9 +345,7 @@ def exit_decision(trade, signal, now):
         return dict(reason=None, profit_active=trade["profit_active"])
     active = ratchet_active(trade["side"], trade["entry_price"],
                             signal["candle_close"], trade["profit_active"], trade["session"])
-    reason = None
-    if ratchet_exit(trade, signal["candle_close"], active, signal["color"]):
-        reason = "brick1" if active else "brick6"
+    reason = ratchet_exit(trade, signal, active)
     return dict(reason=reason, profit_active=active)
 
 

@@ -86,13 +86,18 @@ restart, missed observed candles are reconstructed for activation and the
 stop/trail exit; missed exits fill only at a current quote. Unobserved
 candles cannot be reconstructed. Activation is recalculated from completed
 candle closes since entry, not from LTP-based maximum P&L. Since 2026-11-19,
-the exit rule is a hard stop at `SL_BRICKS` (6) bricks against entry; once
+the exit rule is a hybrid: before `SL_BRICKS` (6) bricks of favorable
+movement, the stop is the channel10 rolling-channel stop (price closing
+beyond the trailing 10-brick high/low channel against the trade). Once
 price has moved `SL_BRICKS` bricks in favor, the stop ratchets into a
 single-brick trailing stop that exits the instant the latest completed
 Renko brick's color flips against the trade's direction (one-brick
-reversal). A brick's rupee size is a session-specific percentage of the
-entry price (0.1% morning, 0.15% evening), so the stop and trail scale with
-price rather than using fixed rupee levels. Removing the minute-reservation
+reversal) -- except that once price has moved `BOOK_BRICKS` (10) bricks in
+favor, the full position is booked immediately regardless of brick color,
+so a strong trend isn't given back one brick at a time. A brick's rupee
+size is a session-specific percentage of the entry price (0.1% morning,
+0.15% evening), so the stop, trail and book level all scale with price
+rather than using fixed rupee levels. Removing the minute-reservation
 index means a stale concurrent executor can enter in the same minute another
 executor closes a trade, although a fresh state check blocks that handoff.
 Alert channel defaults to `silver-surfer`. Paper trade

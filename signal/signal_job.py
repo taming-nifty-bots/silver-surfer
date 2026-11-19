@@ -166,7 +166,11 @@ def main():
             except Exception as error:
                 message = utils.exception_detail(error)
                 print(message, flush=True)
-                if message != last_error or now - last_alert >= timedelta(minutes=15):
+                # Every session's first minute has no completed candle yet (the
+                # first candle needs a full minute to close) -- this always
+                # resolves itself by the next minute, so don't alert on it.
+                if (not message.endswith("No completed candles for the current trading day")
+                        and (message != last_error or now - last_alert >= timedelta(minutes=15))):
                     notify(slack, "ERROR: " + message)
                     last_error, last_alert = message, now
             time.sleep(5)
